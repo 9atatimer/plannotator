@@ -15,8 +15,10 @@ import { useOverlayViewport } from '@plannotator/ui/hooks/useOverlayViewport';
 import { FileHeader } from './FileHeader';
 import { BinaryFileNotice } from './BinaryFileNotice';
 import { FileCommentBanner } from './FileCommentBanner';
+import { DiffHScrollbar } from './DiffHScrollbar';
 import { OversizedFileNotice } from './OversizedFileNotice';
-import { isContentlessBinaryPatch, isOversizedReviewStubPatch } from '@plannotator/shared/diff-paths';
+import { isContentlessBinaryPatch, isImagePreviewCandidate, isOversizedReviewStubPatch } from '@plannotator/shared/diff-paths';
+import { ImageDiffPreview } from './ImageDiffPreview';
 import { isFileScopedAnnotation, lineRangeForAnnotation } from '../utils/annotationScope';
 import { lineAnnotationMetadata } from '../utils/annotationDisplay';
 import type { AnnotationScrollTarget } from '../types';
@@ -162,8 +164,18 @@ interface DiffViewerProps {
   status?: import('../types').DiffFileStatus;
   /** Base branch override used for file-content lookups (branch / merge-base modes only). */
   reviewBase?: string;
+  /** False when there is no source behind the diff to expand into (static
+   *  patch review): skip the /api/file-content fetch entirely rather than
+   *  firing a request the server answers 400. Absent means available. */
+  contextExpansionAvailable?: boolean;
   /** Opaque diff snapshot used to reject mutable file-content lookups from another view. */
   reviewSnapshotId?: string;
+  /** Server advertised `imagePreviewSupported`: a hunkless image chunk renders
+   *  as a Before/After preview instead of the binary notice. Absent = off. */
+  imagePreviewAvailable?: boolean;
+  /** Snapshot the image preview binds its requests to (set in PR mode too,
+   *  where `reviewSnapshotId` is not). Falls back to `reviewSnapshotId`. */
+  imageSnapshotId?: string;
   /** Current PR url + diff scope — used to namespace file-comment drafts so they don't leak across in-place PR switches. */
   prUrl?: string;
   prDiffScope?: string;
@@ -240,6 +252,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   status,
   reviewBase,
   reviewSnapshotId,
+  imagePreviewAvailable = false,
+  imageSnapshotId,
+  contextExpansionAvailable = true,
   prUrl,
   prDiffScope,
   isFocused = false,
@@ -386,6 +401,8 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   useEffect(() => {
     const controller = new AbortController();
     setFileContents(null);
+    // Nothing to expand into: the patch is the whole content of the session.
+    if (!contextExpansionAvailable) return;
     const params = new URLSearchParams({ path: filePath });
     if (oldPath) params.set('oldPath', oldPath);
     if (reviewBase) params.set('base', reviewBase);
@@ -399,7 +416,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       })
       .catch(() => {}); // Silent fallback — no expansion in demo mode
     return () => controller.abort();
-  }, [filePath, oldPath, reviewBase, reviewSnapshotId]);
+  }, [filePath, oldPath, reviewBase, reviewSnapshotId, contextExpansionAvailable]);
 
   // Re-parse the patch with full file contents so hunk indices are computed
   // against the complete file (isPartial: false), enabling expansion.
@@ -776,6 +793,13 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     [patch, isOversizedStub],
   );
 
+  // A hunkless chunk for an image path previews the images instead (#1598);
+  // the notices above stay its fallback.
+  const isImagePreview = useMemo(
+    () => imagePreviewAvailable && isImagePreviewCandidate(patch, filePath, oldPath),
+    [imagePreviewAvailable, patch, filePath, oldPath],
+  );
+
   // Replay a selected line/range comment's anchor as the controlled highlight so
   // clicking it (inline card or sidebar) lights up its lines. A live compose
   // selection (pendingSelection) wins while the toolbar is open; file-scoped
@@ -789,6 +813,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
 
   return (
     <div className="h-full flex flex-col">
+      {/* `relative` anchors this file's horizontal scrollbar to the header's
+          bottom edge (#1048) — same placement as the all-files surface. */}
+      <div className="relative flex-none">
       <FileHeader
         filePath={filePath}
         patch={patch}
@@ -818,6 +845,10 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         stageError={stageError}
         onFileComment={setFileCommentAnchor}
       />
+      {!collapsed && diffOverflow !== 'wrap' && (
+        <DiffHScrollbar className="absolute inset-x-2 bottom-0 z-30" />
+      )}
+      </div>
 
       {!collapsed && <OverlayScrollArea
         className={`flex-1 min-h-0 relative ${isDraggingSplit ? 'select-none' : ''}`}
@@ -827,8 +858,22 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       >
         {/* Specific first, general second, and never both: whichever applies,
             a card with no hunks to draw says why instead of reading as empty. */}
-        {isOversizedStub && <OversizedFileNotice />}
-        {isContentlessBinary && <BinaryFileNotice />}
+        {isImagePreview ? (
+          <ImageDiffPreview
+            filePath={filePath}
+            status={status ?? 'modified'}
+            snapshotId={imageSnapshotId ?? reviewSnapshotId}
+            variant="single"
+            compact={compactTouchLayout}
+            fallback={isOversizedStub ? <OversizedFileNotice /> : isContentlessBinary ? <BinaryFileNotice /> : null}
+            tooLargeFallback={isOversizedStub ? <OversizedFileNotice /> : undefined}
+          />
+        ) : (
+          <>
+            {isOversizedStub && <OversizedFileNotice />}
+            {isContentlessBinary && <BinaryFileNotice />}
+          </>
+        )}
         <FileCommentBanner
           comments={fileComments}
           selectedAnnotationId={selectedAnnotationId}

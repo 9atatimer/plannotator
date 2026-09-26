@@ -1,6 +1,8 @@
 import { describe, test, expect } from "bun:test";
-import { parseMarkdownToBlocks, computeListIndices, extractFrontmatter, exportAnnotations, resolveReferenceLinks } from "./parser";
+import { parseMarkdownToBlocks, computeListIndices, extractFrontmatter, exportAnnotations, exportAnnotationEntry, elementContextExportBlock, resolveReferenceLinks } from "./parser";
 import { shouldStripFrontmatter } from "@plannotator/core/annotatable";
+import { parseHtmlElementContext as coreParseHtmlElementContext } from "@plannotator/core/html-anchor";
+import { parseHtmlElementContext as uiParseHtmlElementContext } from "../components/html-viewer/useHtmlAnnotation";
 import type { Block } from "../types";
 
 /** Tiny factory for list-item blocks used by computeListIndices tests. */
@@ -1669,6 +1671,200 @@ tags:
   });
 });
 
+describe("extractFrontmatter — nested structures (#1485)", () => {
+  test("nested maps and arrays of maps parse into hierarchical structure", () => {
+    const md = `---
+title: Nested Plan
+generated:
+  by: agent-alpha
+  at: 2026-09-16T10:00:00Z
+verified:
+  - by: reviewer-beta
+    at: 2026-09-16T11:00:00Z
+    sources:
+      - url: https://example.com/spec
+        name: specification
+---
+# Content`;
+    const { frontmatter, content, contentStartLine } = extractFrontmatter(md);
+    expect(content).toBe("# Content");
+    expect(contentStartLine).toBe(13);
+    expect(frontmatter).toEqual({
+      title: "Nested Plan",
+      generated: {
+        by: "agent-alpha",
+        at: "2026-09-16T10:00:00Z",
+      },
+      verified: [
+        {
+          by: "reviewer-beta",
+          at: "2026-09-16T11:00:00Z",
+          sources: [
+            {
+              url: "https://example.com/spec",
+              name: "specification",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  test("same-named child keys at different hierarchy levels do not clobber", () => {
+    const md = `---
+generated:
+  by: bot
+  at: 2026-09-16T10:00:00Z
+verified:
+  - by: human
+    at: 2026-09-16T12:00:00Z
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter?.generated).toEqual({
+      by: "bot",
+      at: "2026-09-16T10:00:00Z",
+    });
+    expect(frontmatter?.verified).toEqual([
+      {
+        by: "human",
+        at: "2026-09-16T12:00:00Z",
+      },
+    ]);
+  });
+
+  test("array-of-map items group correctly per item", () => {
+    const md = `---
+reviewers:
+  - name: alice
+    role: lead
+  - name: bob
+    role: peer
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter?.reviewers).toEqual([
+      { name: "alice", role: "lead" },
+      { name: "bob", role: "peer" },
+    ]);
+  });
+
+  test("flat scalars and string arrays remain unchanged", () => {
+    const md = `---
+title: Plain Title
+status: draft
+tags:
+  - architecture
+  - performance
+categories:
+  - dev
+  - ops
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter).toEqual({
+      title: "Plain Title",
+      status: "draft",
+      tags: ["architecture", "performance"],
+      categories: ["dev", "ops"],
+    });
+  });
+
+  test("block scalars inside nested maps and CRLF are supported", () => {
+    const md = "---\r\ngenerated:\r\n  summary: >-\r\n    line one\r\n    line two\r\n  by: bot\r\n---\r\nbody";
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter?.generated).toEqual({
+      summary: "line one line two",
+      by: "bot",
+    });
+  });
+
+  test("array of scalar strings inside a map element parses correctly", () => {
+    const md = `---
+verified:
+  - by: reviewer
+    sources:
+      - https://example.com/a
+      - https://example.com/b
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter?.verified).toEqual([
+      {
+        by: "reviewer",
+        sources: [
+          "https://example.com/a",
+          "https://example.com/b",
+        ],
+      },
+    ]);
+  });
+
+  test("a quoted key is still a mapping entry, not a dropped row", () => {
+    // Regression: the quoted-scalar guard swallowed the whole line, so
+    // `"title": "Doc"` produced {} and the row vanished from the
+    // frontmatter card entirely.
+    const md = `---
+"title": "Doc"
+'status': draft
+"nested":
+  k: v
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    // Values keep their quotes exactly as an unquoted key would produce
+    // (`title: "Doc"`); only the KEY's quotes are structural.
+    expect(frontmatter).toEqual({
+      title: '"Doc"',
+      status: "draft",
+      nested: { k: "v" },
+    });
+  });
+
+  test("a quoted key parses identically to the same key unquoted", () => {
+    // The point of the fix: quoting a key changes nothing but the key text.
+    const quoted = extractFrontmatter('---\n"title": "Doc"\n"n":\n  k: v\n---\nb');
+    const plain = extractFrontmatter('---\ntitle: "Doc"\nn:\n  k: v\n---\nb');
+    expect(quoted.frontmatter).toEqual(plain.frontmatter!);
+  });
+
+  test("a line that is only a quoted scalar is still not a mapping entry", () => {
+    const md = `---
+ok: 1
+"just a string"
+"nospace":"value"
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter).toEqual({ ok: "1" });
+  });
+
+  test("a nested map as an item's FIRST key does not swallow its siblings", () => {
+    // Regression: the pending key recorded the dash's indent, so `id`
+    // (indented to the key's column, not the dash's) landed inside `meta`.
+    const md = `---
+items:
+  - meta:
+      k: v
+    id: 1
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter?.items).toEqual([{ meta: { k: "v" }, id: "1" }]);
+  });
+
+  test("an item whose only key is an empty map does not absorb the next item", () => {
+    const md = `---
+items:
+  - meta:
+  - id: 1
+---
+body`;
+    const { frontmatter } = extractFrontmatter(md);
+    expect(frontmatter?.items).toEqual([{}, { id: "1" }]);
+  });
+});
+
 describe("parseMarkdownToBlocks — startLine accuracy", () => {
   test("basic blocks get correct startLine", () => {
     const md = "# Heading\n\nParagraph\n\n- Item";
@@ -1805,6 +2001,28 @@ describe("exportAnnotations — multi-target raw-HTML comments", () => {
     expect(output).toContain(`- "${"x".repeat(120)}…"`);
   });
 
+  test("targets with no element context export byte-identically to the pre-context format", () => {
+    // #1517 added the selector/path locator suffix, and claimed the element
+    // context was additive — but it keyed the suffix off `anchor.selector`,
+    // which every multi-target annotation has always had, so an annotation
+    // restored from an older draft silently changed shape. The locator is a
+    // property of the captured context; without context there is none.
+    const output = exportAnnotations([], [htmlAnn({
+      htmlAdditionalTargets: [
+        { label: "Button", text: "Create", anchor: { selector: "span.btn", tagName: "span", text: "Create" } },
+        { label: "rowchip", text: "adopted by 1" },
+      ],
+    })]);
+    expect(output).toBe(
+      "# Plan Feedback\n\nI've reviewed this plan and have 1 piece of feedback:\n\n" +
+      "## 1. Feedback on: \"Primary chip\"\n> Unify these\n" +
+      "\n**Also applies to 2 more elements:**\n" +
+      "- [Button] \"Create\"\n" +
+      "- [rowchip] \"adopted by 1\"\n" +
+      "\n---\n",
+    );
+  });
+
   test("single-target output is byte-identical to the pre-feature format", () => {
     const single = exportAnnotations([], [htmlAnn()]);
     const empty = exportAnnotations([], [htmlAnn({ htmlAdditionalTargets: [] })]);
@@ -1939,5 +2157,152 @@ describe("parseMarkdownToBlocks — non-markdown plain text (#1029)", () => {
     expect(shouldStripFrontmatter("notes.txt")).toBe(false);
     expect(shouldStripFrontmatter("data.csv")).toBe(false);
     expect(shouldStripFrontmatter("https://example.com/page")).toBe(true); // converted source
+  });
+});
+
+describe("exportAnnotations — element context (raw-HTML / live-app pinpoints)", () => {
+  // Failures to catch: the element block silently disappearing (back to a
+  // one-word placeholder), an annotation WITHOUT context changing shape, a
+  // copied entry drifting from what Send Feedback delivers, and a page-
+  // controlled string breaking out of the fence or inline code.
+  const NAV_CONTEXT = {
+    tag: "nav", id: "site-nav", classes: ["site-nav", "sticky"],
+    path: "body > div#root > header.site-header > nav#site-nav",
+    role: "navigation", name: "Primary",
+    attrs: [["aria-label", "Primary"], ["data-component", "AppNav"]] as Array<[string, string]>,
+    outline: '<nav id="site-nav" class="site-nav sticky" aria-label="Primary">\n  <ul class="nav-list">…</ul>\n  <button class="nav-toggle"></button>\n</nav>',
+    children: 2, rect: { x: 0, y: 0, w: 1280, h: 64, vw: 1280, vh: 800 },
+    landmark: "header.site-header", heading: 'h1 "Acme Analytics"', component: "data-component=AppNav",
+  };
+  const navAnn = (extra: object = {}) => ({
+    blockId: "", startOffset: 0, endOffset: 0, type: "COMMENT", text: "this",
+    originalText: "[element: Navigation]",
+    htmlAnchor: { selector: "nav#site-nav", tagName: "nav", text: "" },
+    elementContext: NAV_CONTEXT,
+    ...extra,
+  });
+
+  test("a text-less pinpoint names its element in the heading and prints the fenced skeleton plus locators", () => {
+    const output = exportAnnotations([], [navAnn()]);
+    expect(output).toContain('## 1. Feedback on the <nav> element — "Primary"\n> this\n');
+    expect(output).not.toContain("[element: Navigation]");
+    expect(output).toContain("````html\n<nav id=\"site-nav\" class=\"site-nav sticky\" aria-label=\"Primary\">\n  <ul class=\"nav-list\">…</ul>\n  <button class=\"nav-toggle\"></button>\n</nav>\n````\n");
+    expect(output).toContain("- **selector** `nav#site-nav`\n");
+    expect(output).toContain("- **path** `body > div#root > header.site-header > nav#site-nav`\n");
+    expect(output).toContain('- **role** navigation · **name** "Primary" · **component** `data-component=AppNav`\n');
+    expect(output).toContain('- **attrs** `aria-label="Primary" data-component="AppNav"`\n');
+    expect(output).toContain("- **box** 0,0 1280×64 (viewport 1280×800)\n");
+    expect(output).toContain('- **near** header.site-header · heading h1 "Acme Analytics"\n');
+    // The block sits between the comment and the closing rule.
+    expect(output.indexOf("> this")).toBeLessThan(output.indexOf("````html"));
+    expect(output.indexOf("**near**")).toBeLessThan(output.indexOf("\n---\n"));
+  });
+
+  test("a pinpoint with real quoted text keeps its quote line and gains the block", () => {
+    const output = exportAnnotations([], [navAnn({ originalText: "Home About Pricing Docs", elementContext: { ...NAV_CONTEXT, text: "Home About Pricing Docs" } })]);
+    expect(output).toContain('## 1. Feedback on: "Home About Pricing Docs"\n> this\n');
+    expect(output).toContain('- **text** "Home About Pricing Docs"\n');
+    expect(output).toContain("- **selector** `nav#site-nav`");
+  });
+
+  test("an annotation without element context exports byte-identically to before", () => {
+    const withoutContext = exportAnnotations([], [navAnn({ elementContext: undefined })]);
+    expect(withoutContext).toBe(
+      "# Plan Feedback\n\nI've reviewed this plan and have 1 piece of feedback:\n\n" +
+      "## 1. Feedback on: \"[element: Navigation]\"\n> this\n\n---\n",
+    );
+  });
+
+  test("the grouped live-app export omits the route line; the single copied entry carries it", () => {
+    const live = navAnn({ pageUrl: "/dashboard?tab=2", elementContext: { ...NAV_CONTEXT, page: { url: "/dashboard?tab=2", title: "Acme — Dashboard" } } });
+    const grouped = exportAnnotations([], [live]);
+    expect(grouped).toContain("## Page: /dashboard?tab=2\n\n");
+    expect(grouped).not.toContain("**route**");
+    const entry = exportAnnotationEntry(live);
+    expect(entry).toContain('- **route** `/dashboard?tab=2` — "Acme — Dashboard"\n');
+    expect(entry.startsWith('Feedback on the <nav> element — "Primary"\n> this\n')).toBe(true);
+  });
+
+  test("a copied entry is the full export's entry body (never drifts from Send Feedback)", () => {
+    const ann = navAnn();
+    const entry = exportAnnotationEntry(ann, { includeRoute: false });
+    const full = exportAnnotations([], [ann]);
+    expect(full).toContain(entry);
+  });
+
+  test("page-controlled strings cannot escape the fence or an inline code span", () => {
+    const hostile = navAnn({
+      elementContext: {
+        ...NAV_CONTEXT,
+        outline: '<nav>\n````\n# INJECTED\n</nav>',
+        path: "body > `nav` > x",
+        name: "Save\n## INJECTED HEADING",
+      },
+    });
+    const output = exportAnnotations([], [hostile]);
+    // The outline's own 4-backtick run cannot close the export fence.
+    const fences = output.match(/^````/gm) ?? [];
+    expect(fences.length).toBe(2);
+    // The injected heading line is fenced content, never markdown structure.
+    const open = output.indexOf("````html");
+    const close = output.indexOf("````", open + 7);
+    const injected = output.indexOf("\n# INJECTED");
+    expect(injected).toBeGreaterThan(open);
+    expect(injected).toBeLessThan(close);
+    expect(output).toContain("- **path** `body > 'nav' > x`\n");
+    expect(output).toContain('Feedback on the <nav> element — "Save ## INJECTED HEADING"');
+  });
+
+  test("additional targets list their selector and path on one line", () => {
+    const output = exportAnnotations([], [navAnn({
+      htmlAdditionalTargets: [
+        { label: "Button", text: "Cancel", anchor: { selector: "button.btn.btn-ghost", tagName: "button", text: "Cancel" }, context: { tag: "button", path: "body > main > form.signup > div.actions > button:nth-of-type(2)" } },
+        { label: "Link", text: "Learn more" },
+      ],
+    })]);
+    expect(output).toContain('- [Button] "Cancel" — `button.btn.btn-ghost` · `body > main > form.signup > div.actions > button:nth-of-type(2)`\n');
+    expect(output).toContain('- [Link] "Learn more"\n');
+  });
+
+  test("exportAnnotationEntry with includeOutline: false omits the outline fence but keeps identity lines", () => {
+    // Failure caught: model turn wasting ~600 chars of context window on the HTML outline
+    // when disabled, or conversely dropping selector/path/role/name identity lines when outline is disabled.
+    const ann = navAnn();
+    // Default includes outline
+    const defaultEntry = exportAnnotationEntry(ann);
+    expect(defaultEntry).toContain("````html\n");
+    expect(defaultEntry).toContain("- **selector** `nav#site-nav`\n");
+    expect(defaultEntry).toContain("- **path** `body > div#root > header.site-header > nav#site-nav`\n");
+    expect(defaultEntry).toContain('- **role** navigation · **name** "Primary" · **component** `data-component=AppNav`\n');
+
+    // With includeOutline: false, outline fence is omitted, identity lines remain
+    const outlineLessEntry = exportAnnotationEntry(ann, { includeOutline: false });
+    expect(outlineLessEntry).not.toContain("````html");
+    expect(outlineLessEntry).not.toContain("<nav id=\"site-nav\"");
+    expect(outlineLessEntry).toContain("- **selector** `nav#site-nav`\n");
+    expect(outlineLessEntry).toContain("- **path** `body > div#root > header.site-header > nav#site-nav`\n");
+    expect(outlineLessEntry).toContain('- **role** navigation · **name** "Primary" · **component** `data-component=AppNav`\n');
+    expect(outlineLessEntry).toContain('- **attrs** `aria-label="Primary" data-component="AppNav"`\n');
+    expect(outlineLessEntry).toContain("- **box** 0,0 1280×64 (viewport 1280×800)\n");
+    expect(outlineLessEntry).toContain('- **near** header.site-header · heading h1 "Acme Analytics"\n');
+  });
+
+  test("elementContextExportBlock respects includeOutline option", () => {
+    // Failure caught: elementContextExportBlock ignoring includeOutline: false when called directly.
+    const ann = navAnn();
+    const blockWithOutline = elementContextExportBlock(ann, { includeOutline: true });
+    expect(blockWithOutline).toContain("````html\n");
+    expect(blockWithOutline).toContain("- **selector** `nav#site-nav`\n");
+
+    const blockWithoutOutline = elementContextExportBlock(ann, { includeOutline: false });
+    expect(blockWithoutOutline).not.toContain("````html");
+    expect(blockWithoutOutline).toContain("- **selector** `nav#site-nav`\n");
+    expect(blockWithoutOutline).toContain("- **path** `body > div#root > header.site-header > nav#site-nav`\n");
+  });
+
+  test("no mirror validator remains: useHtmlAnnotation imports and re-exports core parseHtmlElementContext", () => {
+    // Failure caught: UI keeping a duplicated/diverged hand-mirrored parseHtmlElementContext
+    // instead of importing and re-exporting the authoritative core validator.
+    expect(uiParseHtmlElementContext).toBe(coreParseHtmlElementContext);
   });
 });

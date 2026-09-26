@@ -2,7 +2,8 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
-import { handleAnnotateCommand, handleAnnotateLastCommand } from "./commands";
+import { spawnSync } from "child_process";
+import { handleAnnotateCommand, handleAnnotateLastCommand, handleReviewCommand } from "./commands";
 import { OpenCodePromptDeliveryError } from "./prompt-delivery-error";
 
 // Inject the annotate-server stub through CommandDeps rather than
@@ -52,6 +53,94 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+function git(cwd: string, args: string[]): void {
+  const result = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `git ${args.join(" ")} failed`);
+  }
+}
+
+function initGitRepo(): string {
+  const repoDir = makeTempDir();
+  git(repoDir, ["init", "-q"]);
+  git(repoDir, ["branch", "-M", "main"]);
+  git(repoDir, ["config", "user.email", "test@example.com"]);
+  git(repoDir, ["config", "user.name", "Test"]);
+  writeFileSync(path.join(repoDir, "README.md"), "# repo\n");
+  git(repoDir, ["add", "README.md"]);
+  git(repoDir, ["commit", "-q", "-m", "initial"]);
+  return repoDir;
+}
+
+describe("handleReviewCommand open state (--base / --diff-type)", () => {
+  const originalDataDir = process.env.PLANNOTATOR_DATA_DIR;
+
+  afterEach(() => {
+    if (originalDataDir === undefined) delete process.env.PLANNOTATOR_DATA_DIR;
+    else process.env.PLANNOTATOR_DATA_DIR = originalDataDir;
+  });
+
+  test("forwards the flag base into the diff AND the server options", async () => {
+    // Failure caught: a base computed into the patch but not into the server
+    // payload (or vice versa) — a mixed-base review; plus the explicit/pinned
+    // bits being dropped on the OpenCode embedded path.
+    process.env.PLANNOTATOR_DATA_DIR = makeTempDir();
+    const repoDir = initGitRepo();
+    git(repoDir, ["checkout", "-q", "-b", "develop"]);
+    writeFileSync(path.join(repoDir, "develop.txt"), "develop\n");
+    git(repoDir, ["add", "develop.txt"]);
+    git(repoDir, ["commit", "-q", "-m", "develop"]);
+    git(repoDir, ["checkout", "-q", "-b", "feature/x"]);
+
+    const deps: any = makeDeps();
+    deps.directory = repoDir;
+    const startReviewServerMock = mock(async (_options: any) => ({
+      port: 0,
+      url: "http://localhost",
+      isRemote: false,
+      waitForDecision: async () => ({ approved: false, feedback: "", annotations: [], exit: true }),
+      stop: () => {},
+    }));
+    deps.startReviewServer = startReviewServerMock;
+
+    await handleReviewCommand(
+      { properties: { arguments: "--base develop", sessionID: "session-123" } },
+      deps,
+    );
+
+    expect(startReviewServerMock).toHaveBeenCalledTimes(1);
+    const options = startReviewServerMock.mock.calls[0]?.[0];
+    expect(options.initialBase).toBe("develop");
+    expect(options.initialBaseExplicit).toBe(true);
+    expect(options.openStatePinned).toBe(true);
+    // The empty-config default (since-base) is base-relative, so the seed
+    // requests it explicitly rather than promoting.
+    expect(options.diffType).toBe("since-base");
+  });
+
+  test("a base that does not resolve refuses to start a session", async () => {
+    // Failure caught: the probe being skipped on this host, letting a typo'd
+    // base open a mislabelled merge-base→HEAD diff.
+    process.env.PLANNOTATOR_DATA_DIR = makeTempDir();
+    const repoDir = initGitRepo();
+    const deps: any = makeDeps();
+    deps.directory = repoDir;
+    const startReviewServerMock = mock(async (_options: any) => {
+      throw new Error("must not be reached");
+    });
+    deps.startReviewServer = startReviewServerMock;
+
+    await handleReviewCommand(
+      { properties: { arguments: "--base nope-missing", sessionID: "session-123" } },
+      deps,
+    );
+
+    expect(startReviewServerMock).not.toHaveBeenCalled();
+    const logged = deps.client.app.log.mock.calls.map((c: any[]) => c[0]?.message ?? "").join("\n");
+    expect(logged).toContain("Base ref not found: nope-missing");
+  });
 });
 
 describe("handleAnnotateCommand", () => {
@@ -286,5 +375,65 @@ describe("handleAnnotateLastCommand", () => {
     expect(options.filePath).toBe("last-message");
     expect(options.pasteApiUrl).toBe("https://paste.example.test");
     expect(options.markdown).toBe("Latest assistant message");
+  });
+});
+
+// #1612, embedded runtime: feedback is answered by the agent that wrote the
+// annotated message (or, for a file, the agent the user is talking to), not by
+// OpenCode's default agent.
+describe("annotate feedback agent routing (embedded runtime)", () => {
+  const MESSAGES = [
+    { info: { role: "user", id: "u1", agent: "agent-engineer" }, parts: [{ type: "text", text: "q" }] },
+    { info: { role: "assistant", id: "a1", agent: "agent-engineer" }, parts: [{ type: "text", text: "Engineer answer" }] },
+    { info: { role: "user", id: "u2", agent: "build" }, parts: [{ type: "text", text: "q2" }] },
+    { info: { role: "assistant", id: "a2", agent: "build" }, parts: [{ type: "text", text: "Build answer" }] },
+  ];
+
+  function routingDeps(messages: unknown[], decision: Record<string, unknown>) {
+    const deps: any = makeDeps();
+    deps.client.session.messages = mock(async (_input: unknown) => ({ data: messages }));
+    deps.client.app.agents = mock(async (_input?: unknown) => ({
+      data: [{ name: "build", mode: "primary" }, { name: "agent-engineer", mode: "primary" }],
+    }));
+    deps.startAnnotateServer = mock(async (options: any) => ({
+      port: 0,
+      url: "http://localhost",
+      isRemote: false,
+      options,
+      waitForDecision: async () => ({ annotations: [{ id: "x" }], ...decision }),
+      stop: () => {},
+    }));
+    return deps;
+  }
+
+  test("/plannotator-last returns the picked message's agent", async () => {
+    const deps = routingDeps(MESSAGES, { feedback: "Tighten this.", selectedMessageId: "a1" });
+
+    const outcome = await handleAnnotateLastCommand({ properties: { sessionID: "session-123" } }, deps);
+
+    expect(outcome?.agent).toBe("agent-engineer");
+  });
+
+  test("/plannotator-last with no recorded writer returns no agent", async () => {
+    const deps = routingDeps(
+      MESSAGES.map((m) => ({ ...m, info: { ...m.info, agent: undefined } })),
+      { feedback: "Tighten this.", selectedMessageId: "a1" },
+    );
+
+    const outcome = await handleAnnotateLastCommand({ properties: { sessionID: "session-123" } }, deps);
+
+    expect(outcome).not.toBeNull();
+    expect("agent" in outcome!).toBe(false);
+  });
+
+  test("/plannotator-annotate names the session's current agent", async () => {
+    const projectRoot = makeTempDir();
+    writeFileSync(path.join(projectRoot, "plan.md"), "# Plan\n");
+    const deps = routingDeps(MESSAGES.slice(0, 2), { feedback: "Rename section 2." });
+    deps.directory = projectRoot;
+
+    await handleAnnotateCommand({ properties: { arguments: "plan.md", sessionID: "session-123" } }, deps);
+
+    expect(deps.client.session.prompt.mock.calls[0]?.[0].body.agent).toBe("agent-engineer");
   });
 });

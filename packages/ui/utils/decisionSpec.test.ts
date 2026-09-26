@@ -187,11 +187,12 @@ describe('buildDecisionSpec invariants', () => {
     const inputs: DecisionSpecInput[] = [
       ...allInputs(),
       ...([0, 1, 3] as const).flatMap((count) =>
-        [false, true].map((selfAuthored): DecisionSpecInput => ({
-          app: 'review', gate: true, count, hasFeedback: count > 0,
-          approvalNotesSupported: false,
-          platform: { label: 'GitHub', mrLabel: 'PR', selfAuthored },
-        }))),
+        [false, true].flatMap((selfAuthored) =>
+          [undefined, true, false].map((requestChangesSupported): DecisionSpecInput => ({
+            app: 'review', gate: true, count, hasFeedback: count > 0,
+            approvalNotesSupported: false,
+            platform: { label: 'GitHub', mrLabel: 'PR', selfAuthored, requestChangesSupported },
+          })))),
       ...allInputs().map((input) => ({ ...input, feedbackDelivered: true })),
     ];
     for (const input of inputs) {
@@ -221,12 +222,13 @@ describe('buildDecisionSpec invariants', () => {
     }
   });
 
-  // Guards a stale count in the label after an annotation is deleted.
-  it('interpolates the live count into the pill and the discard copy', () => {
+  // Guards a stale count in the discard copy after an annotation is deleted,
+  // and pins that the primary label itself never carries a count.
+  it('interpolates the live count into the discard copy, never the primary', () => {
     const zero = buildDecisionSpec({
       app: 'annotate', gate: false, count: 0, hasFeedback: true, approvalNotesSupported: false,
     });
-    expect(zero.primary.count).toBeUndefined();
+    expect('count' in zero.primary).toBe(false);
     // Nothing to discard at zero — no discard item with a lying "0 annotations".
     expect(itemIds(zero)).not.toContain('discard-and-finish');
 
@@ -249,7 +251,8 @@ describe('buildDecisionSpec invariants', () => {
     const three = buildDecisionSpec({
       app: 'review', gate: true, count: 3, hasFeedback: true, approvalNotesSupported: true,
     });
-    expect(three.primary.count).toBe(3);
+    expect('count' in three.primary).toBe(false);
+    expect(three.primary.label).toBe('Send Feedback');
     const discard = three.items.find((item) => item.id === 'discard-and-finish')!;
     expect(discard.label).toContain('3');
     expect(discard.confirm!.title).toContain('3');
@@ -322,6 +325,48 @@ describe('buildDecisionSpec platform arm (PR6, §3.4)', () => {
         expect(muted.primary.muted).toBeUndefined();
       }
       expect(open.primary.muted).toBeUndefined();
+    }
+  });
+
+  // #1611: GitHub refuses REQUEST_CHANGES on your own PR exactly like
+  // APPROVE, so when the platform has the review, Request changes… mutes with
+  // its own reason and a live neutral "Comment…" row keeps the empty state
+  // from becoming a dead end.
+  it('mutes Request changes on your own PR where the platform supports it, keeping a live Comment row', () => {
+    const own = buildDecisionSpec({
+      ...platformInput(0, true),
+      platform: { label: 'GitHub', mrLabel: 'PR', selfAuthored: true, requestChangesSupported: true },
+    });
+    const request = own.items.find((item) => item.id === 'request-changes');
+    expect(request?.muted).toBe(true);
+    expect(request?.subtitle).toContain("You can't request changes on your own PR");
+    const comment = own.items.find((item) => item.id === 'note-with-feedback');
+    expect(comment).toBeDefined();
+    expect(comment?.muted).toBeUndefined();
+    expect(own.items.some((item) => !item.muted)).toBe(true);
+
+    const other = buildDecisionSpec({
+      ...platformInput(0, false),
+      platform: { label: 'GitHub', mrLabel: 'PR', selfAuthored: false, requestChangesSupported: true },
+    });
+    expect(other.items.find((item) => item.id === 'request-changes')?.muted).toBeUndefined();
+    expect(itemIds(other)).not.toContain('note-with-feedback');
+  });
+
+  // A platform without a request-changes review (GitLab) must not promise one:
+  // both request-changes rows say they post as a comment, and nothing mutes
+  // on self-authorship because a comment on your own MR is allowed.
+  it('says Request changes posts as a comment where the platform has no such review', () => {
+    for (const count of [0, 3]) {
+      for (const selfAuthored of [false, true]) {
+        const spec = buildDecisionSpec({
+          ...platformInput(count, selfAuthored),
+          platform: { label: 'GitLab', mrLabel: 'MR', selfAuthored, requestChangesSupported: false },
+        });
+        const row = spec.items.find((item) => item.id === (count === 0 ? 'request-changes' : 'note-with-feedback'));
+        expect(row?.subtitle).toContain('GitLab has no request-changes review');
+        expect(row?.muted).toBeUndefined();
+      }
     }
   });
 

@@ -1,11 +1,11 @@
 import { generateId } from '../utils/generateId';
-import React, { useRef, useState, useEffect, useMemo, forwardRef, useImperativeHandle, useCallback } from 'react';
+import React, { useRef, useState, useEffect, useMemo, forwardRef, useImperativeHandle, useCallback, lazy, Suspense } from 'react';
 import { createPortal } from 'react-dom';
 import { AnnotationType, type Block, type Annotation, type EditorMode, type InputMethod, type ImageAttachment, type ActionsLabelMode } from '../types';
 import { applyHighlight, codeBlockClassName, onCodeHighlightSwap } from '../utils/codeHighlight';
 import { paintCodeBlockMark } from '../utils/codeBlockMark';
 import { useFenceTheme } from '../hooks/useFenceTheme';
-import { computeListIndices, groupBlocks, type Frontmatter } from '../utils/parser';
+import { computeListIndices, groupBlocks, type Frontmatter, type FrontmatterValue } from '../utils/parser';
 import { buildHeadingSlugMap } from '../utils/slugify';
 import { copyTextToClipboard } from '../utils/clipboard';
 import { BlockRenderer } from './BlockRenderer';
@@ -17,6 +17,20 @@ import { CodePathValidationContext } from './CodePathValidationContext';
 import { useValidatedCodePaths } from '../hooks/useValidatedCodePaths';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import { FloatingQuickLabelPicker } from './FloatingQuickLabelPicker';
+
+/**
+ * The diagram engine — the renderer slot, the canvas, the comment overlay,
+ * the popout, and (through the viewer) CodeMirror — is loaded by the first
+ * diagram fence in the document and by nothing else. A markdown document
+ * with no diagram never reaches for it; a chunked host that statically
+ * imports this Viewer pays none of it on a plain document read.
+ *
+ * The Suspense fallback is the SAME pending state the block itself shows
+ * while its engine loads (`DiagramPending`), inside the same boxes, so the
+ * source fence paints once and the two waits read as one.
+ */
+const MermaidBlock = lazy(async () => ({ default: (await import('./MermaidBlock')).MermaidBlock }));
+const GraphvizBlock = lazy(async () => ({ default: (await import('./GraphvizBlock')).GraphvizBlock }));
 
 // Debug error boundary to catch silent toolbar crashes
 class ToolbarErrorBoundary extends React.Component<
@@ -40,15 +54,17 @@ import { CommentPopover, type CommentAskAIHandler } from './CommentPopover';
 import { TaterSpriteSitting } from './TaterSpriteSitting';
 import { AttachmentsButton } from './AttachmentsButton';
 import { MessagesIcon } from './icons/MessagesIcon';
-import { GraphvizBlock } from './GraphvizBlock';
-import { MermaidBlock } from './MermaidBlock';
+import { DiagramAnchorClaims, DiagramAnchorClaimsContext } from './diagram/anchorClaims';
+import { DiagramBlockPending } from './diagram/DiagramPending';
 import { isGraphvizLanguage, isMermaidLanguage } from './diagramLanguages';
 import { getIdentity } from '../utils/identity';
 import { type QuickLabel } from '../utils/quickLabels';
+import type { SelectionAction } from '../utils/selectionActions';
+import type { MentionSource } from '../utils/mentions';
 import { DocBadges, type DocBadgesProps, type LinkedDocBadgeInfo } from './DocBadges';
 import { PinpointOverlay } from './PinpointOverlay';
 import { usePinpoint } from '../hooks/usePinpoint';
-import { useAnnotationHighlighter } from '../hooks/useAnnotationHighlighter';
+import { useAnnotationHighlighter, type AnnotationRestoreReport } from '../hooks/useAnnotationHighlighter';
 import { useVimSelection } from '../hooks/useVimSelection';
 import {
   getScrollViewportIntersectionRoot,
@@ -77,6 +93,28 @@ export interface ViewerAnnotationHeaderConfig {
 
 /** Public properties for the Markdown document Viewer. */
 export interface ViewerProps {
+  /**
+   * Opt-in host capability, passed straight through to the selection
+   * toolbars: the host's own commands for the current selection, rendered as
+   * one wand button that opens the package's dropdown. Absent → unchanged.
+   */
+  selectionActions?: SelectionAction[];
+  /** Opt-in host capability: the glyph on the `selectionActions` button on
+   *  both toolbars. Absent → the package's own wand. */
+  selectionActionsIcon?: React.ReactNode;
+  /**
+   * Whether the package's quick labels are offered on the selection toolbars
+   * (default true). `false` hides the Zap picker and the Alt+digit label
+   * shortcuts; the 👍 button is unaffected.
+   */
+  quickLabels?: boolean;
+  /**
+   * Opt-in host capability, forwarded to BOTH comment composers this viewer
+   * mounts (the text-selection composer and the global / code-block one): the
+   * `@` mention source for the composer's picker. The picked ids ride onto the
+   * created annotation as `Annotation.mentions`. Absent → unchanged.
+   */
+  mentionSource?: MentionSource;
   blocks: Block[];
   markdown: string;
   frontmatter?: Frontmatter | null;
@@ -167,6 +205,9 @@ export interface ViewerProps {
   vimHudKeyPanelEnabled?: boolean;
   /** Persist a user request to hide the bottom-right key panel. */
   onVimHudKeyPanelChange?: (enabled: boolean) => void;
+  /** Fires once per highlight-restore pass with what it tried and what it could
+   *  not anchor, so a host can mark the leftovers in its annotation panel. */
+  onRestoreReport?: (report: AnnotationRestoreReport) => void;
 }
 
 export interface ViewerHandle {
@@ -181,6 +222,76 @@ interface CodeBlockToolbarTarget {
   readonly activation: 'pointer' | 'keyboard';
 }
 
+// Named type guard so both taken and fallthrough branches narrow.
+function isFrontmatterMap(value: FrontmatterValue): value is { [key: string]: FrontmatterValue } {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Renders a single frontmatter field or recursive sub-structure.
+ */
+const FrontmatterRow: React.FC<{ field: string; value: FrontmatterValue }> = ({ field, value }) => {
+  if (isFrontmatterMap(value)) {
+    const subEntries = Object.entries(value);
+    return (
+      <div className="flex flex-col gap-1.5">
+        <span className="font-medium text-muted-foreground">{field}:</span>
+        <div className="pl-4 grid gap-1.5">
+          {subEntries.map(([k, v]) => (
+            <FrontmatterRow key={k} field={k} value={v} />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (Array.isArray(value)) {
+    const isArrayOfMaps = value.some((v) => typeof v === 'object' && v !== null);
+    if (isArrayOfMaps) {
+      return (
+        <div className="flex flex-col gap-1.5">
+          <span className="font-medium text-muted-foreground">{field}:</span>
+          <div className="pl-4 grid gap-2">
+            {value.map((item, i) => (
+              <div key={i} className="p-2 bg-muted/40 border border-border/40 rounded grid gap-1.5">
+                {isFrontmatterMap(item) ? (
+                  Object.entries(item).map(([k, v]) => (
+                    <FrontmatterRow key={k} field={k} value={v} />
+                  ))
+                ) : (
+                  <span className="text-foreground">{typeof item === 'string' ? item : String(item)}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex gap-2">
+        <span className="font-medium text-muted-foreground min-w-[80px]">{field}:</span>
+        <span className="text-foreground">
+          <span className="flex flex-wrap gap-1">
+            {value.map((v, i) => (
+              <span key={i} className="px-1.5 py-0.5 bg-primary/10 text-primary rounded text-xs">
+                {typeof v === 'string' ? v : String(v)}
+              </span>
+            ))}
+          </span>
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex gap-2">
+      <span className="font-medium text-muted-foreground min-w-[80px]">{field}:</span>
+      <span className="text-foreground">{value}</span>
+    </div>
+  );
+};
+
 /**
  * Renders YAML frontmatter as a styled metadata card.
  */
@@ -192,22 +303,7 @@ const FrontmatterCard: React.FC<{ frontmatter: Frontmatter }> = ({ frontmatter }
     <div className="mt-4 mb-6 p-4 bg-muted/30 border border-border/50 rounded-lg">
       <div className="grid gap-2 text-sm">
         {entries.map(([key, value]) => (
-          <div key={key} className="flex gap-2">
-            <span className="font-medium text-muted-foreground min-w-[80px]">{key}:</span>
-            <span className="text-foreground">
-              {Array.isArray(value) ? (
-                <span className="flex flex-wrap gap-1">
-                  {value.map((v, i) => (
-                    <span key={i} className="px-1.5 py-0.5 bg-primary/10 text-primary rounded text-xs">
-                      {v}
-                    </span>
-                  ))}
-                </span>
-              ) : (
-                value
-              )}
-            </span>
-          </div>
+          <FrontmatterRow key={key} field={key} value={value} />
         ))}
       </div>
     </div>
@@ -343,6 +439,10 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   mode,
   inputMethod = 'drag',
   taterMode,
+  selectionActions,
+  selectionActionsIcon,
+  quickLabels,
+  mentionSource,
   globalAttachments = [],
   onAddGlobalAttachment,
   onRemoveGlobalAttachment,
@@ -364,6 +464,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   imageBaseDir,
   codePathBaseDir,
   disableCodePathValidation,
+  onRestoreReport,
   copyLabel,
   actionsLabelMode = 'full',
   archiveInfo,
@@ -463,6 +564,15 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   const lastAutoScrolledHashRef = useRef<string | null>(null);
   const [isStuck, setIsStuck] = useState(false);
 
+  // Reported only when the text-search rescue could not re-anchor either, so
+  // the annotation is listed in the panel with no highlight in the document.
+  const handleRestoreMismatch = useCallback((annotation: Annotation, restoredText: string) => {
+    console.warn(
+      `Annotation ${annotation.id} could not be re-anchored: stored positions resolved onto ` +
+      `"${restoredText.slice(0, 50)}" and its text "${annotation.originalText.slice(0, 50)}" is no longer in the document.`,
+    );
+  }, []);
+
   // Shared annotation infrastructure via hook
   const {
     toolbarState,
@@ -489,6 +599,17 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     selectedAnnotationId,
     mode,
     enabled: !readOnly,
+    // Markdown documents drift between the moment a draft/share is written and
+    // the moment it is restored (a plan revision, a re-rendered block, a
+    // renderer change that adds or drops elements — #1509 hoisted an alert's
+    // bold first line onto the icon row, which renumbers every later
+    // `parentIndex`). web-highlighter's stored metas are positional, so a
+    // drifted anchor resolves onto the WRONG text and paints silently. Verify
+    // the painted text against the annotation's own quote so a bad resolve is
+    // dropped and the text-search rescue runs instead of a wrong highlight.
+    verifyRestoredContent: true,
+    onRestoreMismatch: handleRestoreMismatch,
+    onRestoreReport,
   });
 
   // Refs for code block annotation path
@@ -505,6 +626,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     images?: ImageAttachment[],
     isQuickLabel?: boolean,
     quickLabelTip?: string,
+    mentions?: readonly string[],
   ) => {
     if (readOnlyRef.current) return;
 
@@ -524,6 +646,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
       createdA: Date.now(),
       author: getIdentity(),
       images,
+      // Host capability: present only when a mentionSource was supplied AND a
+      // token survived, so a code-block comment without one is unchanged.
+      ...(mentions && mentions.length > 0 ? { mentions } : {}),
       ...(isQuickLabel ? { isQuickLabel: true } : {}),
       ...(quickLabelTip ? { quickLabelTip } : {}),
     };
@@ -904,7 +1029,11 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     setCodeBlockToolbar(null);
   };
 
-  const handleViewerCommentSubmit = (text: string, images?: ImageAttachment[]) => {
+  const handleViewerCommentSubmit = (
+    text: string,
+    images?: ImageAttachment[],
+    mentions?: readonly string[],
+  ) => {
     if (readOnlyRef.current || !viewerCommentPopover) return;
 
     if (viewerCommentPopover.isGlobal) {
@@ -922,12 +1051,22 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
         createdA: Date.now(),
         author: getIdentity(),
         images,
+        ...(mentions && mentions.length > 0 ? { mentions } : {}),
       };
       onAddAnnotation(newAnnotation);
     } else if (viewerCommentPopover.codeBlock) {
       const codeEl = viewerCommentPopover.codeBlock.element.querySelector('code');
       if (codeEl) {
-        applyCodeBlockAnnotation(viewerCommentPopover.codeBlock.block.id, codeEl, AnnotationType.COMMENT, text, images);
+        applyCodeBlockAnnotation(
+          viewerCommentPopover.codeBlock.block.id,
+          codeEl,
+          AnnotationType.COMMENT,
+          text,
+          images,
+          undefined,
+          undefined,
+          mentions,
+        );
       }
     }
 
@@ -1018,8 +1157,31 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     </>
   );
 
+  // The document's diagram blocks, in order: a diagram comment that names
+  // none of them (an external POST, a deleted fence) is resolved by anchor
+  // against each, first resolver wins (see diagram/anchorClaims).
+  const diagramBlockKey = blocks
+    .filter((b) => b.type === 'code' && (isMermaidLanguage(b.language) || isGraphvizLanguage(b.language)))
+    .map((b) => b.id)
+    .join('\n');
+  const diagramClaims = useMemo(
+    () => new DiagramAnchorClaims(diagramBlockKey === '' ? [] : diagramBlockKey.split('\n')),
+    [diagramBlockKey],
+  );
+  // With no diagram in the document nobody can resolve a diagram comment:
+  // it is unanchored, and the highlighter (which skips it) will not say so.
+  useEffect(() => {
+    if (diagramBlockKey !== '' || onRestoreReport === undefined) return;
+    // `!= null`, not `!== undefined`: a nullish anchor is no anchor at all —
+    // the highlighter restores such a row by text, so it must not be counted
+    // here as a diagram comment nothing could resolve.
+    const ids = annotations.filter((ann) => ann.diagramAnchor != null).map((ann) => ann.id);
+    if (ids.length > 0) onRestoreReport({ attempted: ids, unanchored: ids });
+  }, [annotations, diagramBlockKey, onRestoreReport]);
+
   return (
     <CodePathValidationContext.Provider value={codePathValidation}>
+    <DiagramAnchorClaimsContext.Provider value={diagramClaims}>
     <div className="relative z-50 w-full" style={maxWidth === null ? undefined : { maxWidth: maxWidth ?? 832 }}>
       {taterMode && <TaterSpriteSitting />}
       <article
@@ -1115,6 +1277,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                       onToggleCheckbox={readOnly ? undefined : onToggleCheckbox}
                       checkboxOverrides={checkboxOverrides}
                       githubRepo={repoInfo?.display}
+                      repoHost={repoInfo?.host}
                       headingAnchorId={headingSlugMap.get(block.id)}
                       onNavigateAnchor={scrollToAnchor}
                     />
@@ -1123,9 +1286,29 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               );
             })()
           ) : group.block.type === 'code' && isMermaidLanguage(group.block.language) ? (
-            <MermaidBlock key={group.block.id} block={group.block} />
+            <Suspense key={group.block.id} fallback={<DiagramBlockPending block={group.block} kind="mermaid" />}>
+              <MermaidBlock
+                block={group.block}
+                annotations={annotations}
+                selectedAnnotationId={selectedAnnotationId}
+                onSelectAnnotation={onSelectAnnotation}
+                onAddAnnotation={readOnly ? undefined : onAddAnnotation}
+                readOnly={readOnly}
+                onRestoreReport={onRestoreReport}
+              />
+            </Suspense>
           ) : group.block.type === 'code' && isGraphvizLanguage(group.block.language) ? (
-            <GraphvizBlock key={group.block.id} block={group.block} />
+            <Suspense key={group.block.id} fallback={<DiagramBlockPending block={group.block} kind="graphviz" />}>
+              <GraphvizBlock
+                block={group.block}
+                annotations={annotations}
+                selectedAnnotationId={selectedAnnotationId}
+                onSelectAnnotation={onSelectAnnotation}
+                onAddAnnotation={readOnly ? undefined : onAddAnnotation}
+                readOnly={readOnly}
+                onRestoreReport={onRestoreReport}
+              />
+            </Suspense>
           ) : group.block.type === 'table' ? (
             <TableBlock
               key={group.block.id}
@@ -1135,6 +1318,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               onOpenLinkedDoc={onOpenLinkedDoc}
               onOpenCodeFile={onOpenCodeFile}
               githubRepo={repoInfo?.display}
+              repoHost={repoInfo?.host}
               onNavigateAnchor={scrollToAnchor}
               onHover={(element) => {
                 if (tableHoverTimeoutRef.current) {
@@ -1201,7 +1385,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               }
             />
           ) : (
-            <BlockRenderer imageBaseDir={imageBaseDir} onImageClick={(src, alt) => setLightbox({ src, alt })} key={group.block.id} block={group.block} onOpenLinkedDoc={onOpenLinkedDoc} onOpenCodeFile={onOpenCodeFile} onNavigateAnchor={scrollToAnchor} onToggleCheckbox={readOnly ? undefined : onToggleCheckbox} checkboxOverrides={checkboxOverrides} githubRepo={repoInfo?.display} headingAnchorId={headingSlugMap.get(group.block.id)} />
+            <BlockRenderer imageBaseDir={imageBaseDir} onImageClick={(src, alt) => setLightbox({ src, alt })} key={group.block.id} block={group.block} onOpenLinkedDoc={onOpenLinkedDoc} onOpenCodeFile={onOpenCodeFile} onNavigateAnchor={scrollToAnchor} onToggleCheckbox={readOnly ? undefined : onToggleCheckbox} checkboxOverrides={checkboxOverrides} githubRepo={repoInfo?.display} repoHost={repoInfo?.host} headingAnchorId={headingSlugMap.get(group.block.id)} />
           )
         )}
 
@@ -1215,6 +1399,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               onClose={handleToolbarClose}
               onRequestComment={handleRequestComment}
               onQuickLabel={handleQuickLabel}
+              selectionActions={selectionActions}
+              selectionActionsIcon={selectionActionsIcon}
+              quickLabels={quickLabels}
               copyText={toolbarState.selectionText}
               hideCopyButton={!isTouchDevice}
               closeOnScrollOut
@@ -1270,6 +1457,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                 onClose={handleCodeBlockToolbarClose}
                 onRequestComment={handleCodeBlockRequestComment}
                 onQuickLabel={handleCodeBlockQuickLabel}
+                selectionActions={selectionActions}
+                selectionActionsIcon={selectionActionsIcon}
+                quickLabels={quickLabels}
                 isExiting={isCodeBlockToolbarExiting}
                 onMouseEnter={() => {
                   if (hoverTimeoutRef.current) {
@@ -1305,6 +1495,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
             onOpenLinkedDoc={onOpenLinkedDoc}
             onOpenCodeFile={onOpenCodeFile}
             githubRepo={repoInfo?.display}
+            repoHost={repoInfo?.host}
             onNavigateAnchor={scrollToAnchor}
           />
         )}
@@ -1347,6 +1538,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               draftKey={`plan:${commentDraftScope}:${hookCommentPopover.draftKey}`}
               onSubmit={hookCommentSubmit}
               onClose={hookCommentClose}
+              mentionSource={mentionSource}
               allowImages={allowImages}
               skillReferences
               onAskAI={onAskAI}
@@ -1371,6 +1563,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
             }`}
             onSubmit={handleViewerCommentSubmit}
             onClose={handleViewerCommentClose}
+            mentionSource={mentionSource}
             allowImages={allowImages}
             skillReferences
             onAskAI={onAskAI}
@@ -1420,6 +1613,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
         document.body
       )}
     </div>
+    </DiagramAnchorClaimsContext.Provider>
     </CodePathValidationContext.Provider>
   );
 });

@@ -25,7 +25,7 @@ export interface CompactReviewDestination {
 }
 
 export interface CompactReviewAction {
-  id: 'exit' | 'feedback' | 'approve' | 'copy' | 'note' | 'discard-finish';
+  id: 'exit' | 'feedback' | 'approve' | 'copy' | 'note' | 'comment' | 'discard-finish';
   label: string;
   subtitle?: string;
   onSelect: () => void;
@@ -34,7 +34,6 @@ export interface CompactReviewAction {
 
 interface ReviewHeaderMenuProps {
   onOpenSettings: () => void;
-  onOpenReviewSetup?: () => void;
   onOpenExport: () => void;
   onCopyAgentInstructions: () => void;
   onToggleFileTree: () => void;
@@ -57,7 +56,6 @@ interface ReviewHeaderMenuProps {
 
 export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
   onOpenSettings,
-  onOpenReviewSetup,
   onOpenExport,
   onCopyAgentInstructions,
   onToggleFileTree,
@@ -207,20 +205,6 @@ export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
             icon={<SettingsIcon />}
             label="Settings"
           />
-          {onOpenReviewSetup && (
-            <ActionMenuItem
-              onClick={() => {
-                closeMenu();
-                onOpenReviewSetup();
-              }}
-              icon={(
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 5h16M4 10h16M4 15h16M4 20h10" />
-                </svg>
-              )}
-              label="Set up review view"
-            />
-          )}
           <ActionMenuItem
             onClick={() => {
               closeMenu();
@@ -396,7 +380,7 @@ const CompactReviewActionIcon: React.FC<{ kind: CompactReviewAction['id'] }> = (
       </svg>
     );
   }
-  if (kind === 'feedback' || kind === 'note') {
+  if (kind === 'feedback' || kind === 'note' || kind === 'comment') {
     return (
       <svg className="w-3.5 h-3.5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-4l-4 4v-4z" />

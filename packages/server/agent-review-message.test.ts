@@ -32,6 +32,8 @@ describe("buildAgentReviewUserMessage", () => {
       ["jj-last", "jj diff --git -r @-"],
       ["jj-line", "jj diff --git --from 'heads(::@ & ::(trunk()))' --to @"],
       ["jj-all", "jj diff --git --from 'root()' --to @"],
+      // Commits rail: first parent, never `jj diff -r` (all parents on a merge).
+      ["jj-commit:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "jj diff --git --from 'first_parent(commit_id(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa))' --to 'commit_id(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)'"],
     ] as const;
 
     for (const [diffType, command] of cases) {
@@ -68,6 +70,18 @@ describe("buildAgentReviewUserMessage", () => {
 
     expect(message).toContain("Review the following code changes");
     expect(message).toContain(patch);
+  });
+
+  test("uses the inline patch as Ask AI context for static patch reviews", () => {
+    // given
+    const diffType = "static-patch";
+
+    // when
+    const message = buildAgentReviewUserMessage(patch, diffType, undefined, undefined, true);
+
+    // then
+    expect(message).toContain(patch);
+    expect(message).not.toContain("working tree");
   });
 
   test("treats the inline GitButler patch as authoritative", () => {
@@ -294,9 +308,9 @@ describe("getLocalDiffInstruction", () => {
 });
 
 describe("buildClaudeCommand", () => {
-  test("defaults to Opus 5 when the caller passes no model", () => {
+  test("defaults to the opus alias (the CLI resolves latest) when the caller passes no model", () => {
     const command = buildClaudeCommand("review").command;
-    expect(command[command.indexOf("--model") + 1]).toBe("claude-opus-5");
+    expect(command[command.indexOf("--model") + 1]).toBe("opus");
   });
 
   test("still honours an explicitly requested model", () => {
