@@ -46,7 +46,8 @@ export type PromptRuntime =
   | "pi"
   | "codex"
   | "gemini-cli"
-  | "oh-my-pi";
+  | "oh-my-pi"
+  | "mistral-vibe";
 
 interface PromptSectionConfig {
   [key: string]: string | Partial<Record<PromptRuntime, PromptSectionOverrides>> | undefined;
@@ -155,15 +156,17 @@ export interface PlannotatorConfig {
    * honestly ("detected, skipped"), and never removes an integration a
    * previous install already wired. Overridden by the
    * PLANNOTATOR_SKIP_CODEX_INSTALL / PLANNOTATOR_SKIP_GEMINI_INSTALL /
-   * PLANNOTATOR_SKIP_KIRO_INSTALL / PLANNOTATOR_SKIP_OPENCODE_INSTALL env
-   * vars, which are in turn overridden by the --skip-codex / --skip-gemini /
-   * --skip-kiro / --skip-opencode flags. OpenCode has no detection leg, so
-   * its entry is a plain do-not-write switch. Default: all off.
+   * PLANNOTATOR_SKIP_KIRO_INSTALL / PLANNOTATOR_SKIP_VIBE_INSTALL /
+   * PLANNOTATOR_SKIP_OPENCODE_INSTALL env vars, which are in turn overridden
+   * by the --skip-codex / --skip-gemini / --skip-kiro / --skip-vibe /
+   * --skip-opencode flags. OpenCode has no detection leg, so its entry is a
+   * plain do-not-write switch. Default: all off.
    */
   skipInstall?: {
     codex?: boolean;
     gemini?: boolean;
     kiro?: boolean;
+    vibe?: boolean;
     opencode?: boolean;
   };
   /**
@@ -248,6 +251,21 @@ export interface PlannotatorConfig {
    * PLANNOTATOR_CURSOR_SANDBOX env var, which takes precedence.
    */
   cursorSandbox?: boolean;
+  /**
+   * Query the git remote during code review (issue #1553). When true
+   * (default), a local git review runs `git ls-remote --symref origin HEAD`
+   * to discover the remote default branch and to tell whether the baseline is
+   * behind it ("Baseline is behind GitHub"). Set to false when that network
+   * call is unwanted — most sharply when SSH authentication is backed by a
+   * hardware token, where every probe is a physical touch prompt. With it off
+   * the session runs entirely from local refs: the base stays what local
+   * discovery resolved and the behind-the-remote banner never shows — and with
+   * it the one-click Fetch, which lives in that banner, though the
+   * `/api/fetch-base` endpoint itself stays reachable. Mirrors the
+   * PLANNOTATOR_GIT_REMOTE_CHECK env var,
+   * which takes precedence; `review --no-git-remote-check` beats both.
+   */
+  gitRemoteCheck?: boolean;
   /**
    * Display-only hostname for advertised session URLs (issue #657). Lets a
    * remote-mode user hand out a reachable link (e.g. a Tailscale MagicDNS
@@ -847,6 +865,35 @@ export function resolveCursorSandbox(config: PlannotatorConfig): boolean {
     return v !== "0" && v !== "false" && v !== "disabled";
   }
   return coerceConfigBoolean(config.cursorSandbox, true);
+}
+
+/**
+ * Resolve whether code review may query the git remote (issue #1553).
+ *
+ * Priority (highest wins):
+ *   `review --no-git-remote-check`  →  PLANNOTATOR_GIT_REMOTE_CHECK env var
+ *   →  config.gitRemoteCheck  →  default true
+ *
+ * Env values `0` / `false` / `disabled` turn the remote check off; anything
+ * else — including `1` / `true` — keeps it on. "Off" means the whole session
+ * makes no `ls-remote` call at all, startup probes included: the compare
+ * target stays whatever local ref discovery resolved, and the
+ * behind-the-remote banner never shows (and with it the one-click Fetch it
+ * carries). `POST /api/fetch-base` stays reachable on its own predicate: an
+ * explicit Fetch is the user asking for the network.
+ */
+export function resolveGitRemoteCheck(
+  cliNoGitRemoteCheck: boolean,
+  config: PlannotatorConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (cliNoGitRemoteCheck) return false;
+  const envVal = env.PLANNOTATOR_GIT_REMOTE_CHECK;
+  if (envVal !== undefined) {
+    const v = envVal.trim().toLowerCase();
+    return v !== "0" && v !== "false" && v !== "disabled";
+  }
+  return coerceConfigBoolean(config.gitRemoteCheck, true);
 }
 
 /**

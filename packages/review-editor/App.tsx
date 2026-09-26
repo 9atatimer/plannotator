@@ -19,6 +19,7 @@ import {
   buildReviewApprovalBody,
   compactPrimaryIdForReviewDecision,
   compactRowIdForReviewDecisionItem,
+  compactRowIdForPlatformDecisionItem,
   createGeneralReviewComment,
   readApprovalNotesAdvert,
   resolvePlatformDecisionAction,
@@ -41,10 +42,16 @@ import { useAIProviderConfig } from '@plannotator/ui/hooks/useAIProviderConfig';
 import { useAIProviderActivation } from '@plannotator/ui/hooks/useAIProviderActivation';
 import { LookAndFeelAnnouncementDialog } from '@plannotator/ui/components/LookAndFeelAnnouncementDialog';
 import { markLookAndFeelChoiceResolved, needsLookAndFeelAnnouncement } from '@plannotator/ui/utils/lookAndFeelAnnouncement';
+import { TerminalToolsAnnouncementDialog } from '@plannotator/ui/components/TerminalToolsAnnouncementDialog';
+import {
+  markTerminalToolsAnnouncementSeen,
+  needsTerminalToolsAnnouncement,
+  terminalToolsAnnouncementCanShow,
+} from '@plannotator/ui/utils/terminalToolsAnnouncement';
 import { CodeAnnotation, CodeAnnotationType, SelectedLineRange, TokenAnnotationMeta, ConventionalLabel, ConventionalDecoration, Annotation, CommentAnnotation, AgentJobInfo, type ArtifactAnnotationMeta, type CallFlowAnnotationTarget } from '@plannotator/ui/types';
 import type { CommentAskAIHandler } from '@plannotator/ui/components/CommentPopover';
 import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
-import { useCodeAnnotationDraft } from '@plannotator/ui/hooks/useCodeAnnotationDraft';
+import { useCodeAnnotationDraft, type CodeDraftMergeItems, type CodeDraftTargetState } from '@plannotator/ui/hooks/useCodeAnnotationDraft';
 import { useGitAdd } from './hooks/useGitAdd';
 import { generateId } from './utils/generateId';
 import type { SuggestionHunk } from './edit/deriveSuggestions';
@@ -145,12 +152,12 @@ import {
 } from './dock/reviewPanelTypes';
 import type { DiffFile, AnnotationScrollTarget } from './types';
 import { annotationMatchesPrScope, proseAnnotationMatchesPr } from './utils/annotationScope';
-import type { DiffOption, WorktreeInfo, GitContext, SinceBaseSections, CommitDiffInfo } from '@plannotator/shared/types';
+import { annotationNavigation, reanchorCodeAnnotations, restorableViewedFiles } from './utils/codeAnnotationAnchor';
+import type { DiffOption, WorktreeInfo, GitContext, SinceBaseSections, CommitDiffInfo, ReviewSourceKind } from '@plannotator/shared/types';
 import { SectionsPanel } from './components/SectionsPanel';
 import { CommitsPanel } from './components/CommitsPanel';
 import { useCommitsView } from './hooks/useCommitsView';
-import { ReviewSetupDialog } from './components/ReviewSetupDialog';
-import { initializeReviewSetup, markReviewSetupSeen } from './utils/reviewSetup';
+import { shouldRepairPanelPair } from './utils/panelPairRepair';
 import { resolvePanelView } from './utils/resolvePanelView';
 import { isCommitDiffType, resolveCommitExitDiff, type CommitViewRestoreTarget } from './utils/commitViewRestore';
 import { GuideIntroDialog } from './components/GuideIntroDialog';
@@ -173,7 +180,7 @@ import { ExternalLineAnnotationComposer } from './components/ExternalLineAnnotat
 import { DestinationSpotlight } from './components/DestinationSpotlight';
 import { needsDestinationSpotlight, markDestinationSpotlightSeen } from './utils/destinationSpotlight';
 import { TextShimmer } from '@plannotator/ui/components/TextShimmer';
-import type { PRMetadata } from '@plannotator/shared/pr-types';
+import type { PRMetadata, PRReviewAction } from '@plannotator/shared/pr-types';
 import type { PRDiffScope, PRDiffScopeOption, PRStackInfo, PRStackTree } from '@plannotator/shared/pr-stack';
 import { altKey } from '@plannotator/ui/utils/platform';
 import { copyTextToClipboard } from '@plannotator/ui/utils/clipboard';
@@ -588,13 +595,14 @@ const ReviewApp: React.FC = () => {
   const callFlowAvailable = callFlowEnabled && callFlowAdvert.available;
   const { state: callFlowAnalysis, retry: retryCallFlowAnalysis } = useCallFlowAnalysis(snapshotId, callFlowAvailable);
   const [isFetchingBase, setIsFetchingBase] = useState(false);
-  // Which left panel is showing. The persisted value (Settings / first-run
-  // dialog, written through the coupled setters in config/reviewView)
-  // decides what a review OPENS on unless a last-used view is recorded; the
-  // header toggle is a session control layered over both — it NEVER writes
-  // the persisted view/diff pair. Changing the default is an explicit
-  // Settings/setup-dialog act, not a side effect of looking at another view
-  // mid-review; the toggle only records its choice as the last-used memo.
+  // Which left panel is showing. The persisted value (Settings, written
+  // through the coupled setters in config/reviewView) decides what a review
+  // OPENS on unless a last-used view is recorded; the header toggle is a
+  // session control layered over both — it NEVER writes the persisted
+  // view/diff pair. Changing the default is an explicit Settings act, not a
+  // side effect of looking at another view mid-review; the toggle only
+  // records its choice as the last-used memo. With no cookie at all the
+  // registry default (Tree) decides.
   const persistedPanelView = useConfigValue('reviewPanelView');
   const lastUsedPanelView = useConfigValue('reviewPanelViewLastUsed');
   const [sessionPanelView, setSessionPanelView] = useState<'sections' | 'commits' | 'tree' | null>(null);
@@ -605,12 +613,10 @@ const ReviewApp: React.FC = () => {
     // never recorded — picking it leaves last-used at its previous value.
     if (view !== 'commits') configStore.set('reviewPanelViewLastUsed', view);
   }, []);
-  // First-run review-setup chooser (panel view + tree default diff).
-  const [showReviewSetup, setShowReviewSetup] = useState(false);
-  // True only for the first-run showing (where dismissing applies the recommended
-  // default). A reopen from the header menu must NOT snap the user's mid-session
-  // diff back to the default.
-  const reviewSetupIsFirstRun = useRef(false);
+  // The caller pinned this session's opening diff type and/or base (CLI
+  // flags). Mount effects must not auto-switch the diff or self-heal the
+  // persisted panel pair for such a session.
+  const [openStatePinned, setOpenStatePinned] = useState(false);
   const [agentCwd, setAgentCwd] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -641,6 +647,16 @@ const ReviewApp: React.FC = () => {
   // that never sends the field renders no approve-carrying items (PR3
   // behavior); read off every diff payload that carries it.
   const [approvalNotesSupported, setApprovalNotesSupported] = useState(false);
+  // Image preview capability advert (#1598): can the server read Before/After
+  // bytes of changed images? Absent (old server, demo) reads as false, so no
+  // preview renders and no /api/review-image request is ever issued.
+  const [imagePreviewSupported, setImagePreviewSupported] = useState(false);
+  // Session-constant capability advert from `/api/diff`: 'patch' means the
+  // diff is caller-supplied bytes (`plannotator review --patch-file`) with no
+  // repository behind it. ABSENT reads as 'vcs', so an old server keeps every
+  // affordance exactly as before.
+  const [sourceKind, setSourceKind] = useState<ReviewSourceKind>('vcs');
+  const isStaticPatch = sourceKind === 'patch';
   const [repoInfo, setRepoInfo] = useState<{ display: string; branch?: string } | null>(null);
 
   useEffect(() => {
@@ -690,12 +706,13 @@ const ReviewApp: React.FC = () => {
     if (submitted) reviewHistory.clear();
   }, [reviewHistory, submitted]);
 
-  // The Commits view (linear history rail) exists for plain local git
-  // sessions only — PR/workspace/jj/p4 keep their existing panels. Unlike
+  // The Commits view (linear history rail) exists for plain local git and jj
+  // sessions — PR/workspace/GitButler/p4 keep their existing panels. Unlike
   // sections it has NO coupled diff: the review opens on the user's normal
   // default until a commit is clicked, and the clicked sha is never persisted.
   // Declared this early because the global keyboard handler consults it.
-  const commitsCapable = !prMetadata && reviewMode !== 'workspace' && gitContext?.vcsType === 'git';
+  const commitsVcs = gitContext?.vcsType === 'git' || gitContext?.vcsType === 'jj' ? gitContext.vcsType : null;
+  const commitsCapable = !prMetadata && reviewMode !== 'workspace' && commitsVcs !== null;
   const showCommitsPanel = commitsCapable && panelView === 'commits';
   // The diff the session was reviewing before the Commits view's commit
   // clicks (or its HEAD auto-select) took over the single session-global
@@ -729,7 +746,8 @@ const ReviewApp: React.FC = () => {
   const [isPlatformActioning, setIsPlatformActioning] = useState(false);
   const [platformActionError, setPlatformActionError] = useState<string | null>(null);
   const [platformUser, setPlatformUser] = useState<string | null>(null);
-  const [platformCommentDialog, setPlatformCommentDialog] = useState<{ action: 'approve' | 'comment'; plan: ReviewSubmission } | null>(null);
+  // `chooseEvent` (#1611): the dialog offers Comment / Request changes.
+  const [platformCommentDialog, setPlatformCommentDialog] = useState<{ action: PRReviewAction; plan: ReviewSubmission; chooseEvent: boolean } | null>(null);
   const [platformGeneralComment, setPlatformGeneralComment] = useState('');
   const [platformReviewRecovery, setPlatformReviewRecovery] = useState<{
     rootPrUrl: string;
@@ -760,6 +778,14 @@ const ReviewApp: React.FC = () => {
   const mrLabel = prMetadata ? getMRLabel(prMetadata) : 'PR';
   const mrNumberLabel = prMetadata ? getMRNumberLabel(prMetadata) : '';
   const displayRepo = prMetadata ? getDisplayRepo(prMetadata) : '';
+  // #1611: GitHub has a REQUEST_CHANGES review (refused on your own PR, like
+  // approve); GitLab has none, so Request changes posts as a comment there.
+  const requestChangesSupported = prMetadata?.platform === 'github';
+  const requestChangesUnavailableReason = !requestChangesSupported
+    ? `${platformLabel} has no request-changes review; this posts as a comment.`
+    : isOwnPR
+      ? `You can't request changes on your own pull request on ${platformLabel}.`
+      : undefined;
   const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0';
   const updateInfo = useUpdateCheck();
   const updateToastShown = useRef(false);
@@ -951,9 +977,15 @@ const ReviewApp: React.FC = () => {
   }, [annotations, externalAnnotations]);
   const allAnnotationsRef = useRef(allAnnotations);
   allAnnotationsRef.current = allAnnotations;
+  // What the diff surfaces draw inline. Same array when nothing is outdated,
+  // so non-PR sessions see no identity change.
+  const diffAnnotations = useMemo(
+    () => (allAnnotations.some((a) => a.outdated) ? allAnnotations.filter((a) => !a.outdated) : allAnnotations),
+    [allAnnotations],
+  );
 
   // Auto-save code annotation drafts
-  const { draftBanner, restoreDraft, getDraftGeneration, dismissDraft } = useCodeAnnotationDraft({
+  const { draftBanner, restoreDraft, getDraftGeneration, dismissDraft, adoptDraftTarget } = useCodeAnnotationDraft({
     annotations: allAnnotations,
     descriptionAnnotations,
     commentAnnotations,
@@ -961,17 +993,75 @@ const ReviewApp: React.FC = () => {
     autoViewSuppressed,
     isApiMode: !!origin,
     submitted: !!submitted,
+    onDraftTargetMerge: (items) => draftTargetMergeRef.current(items),
   });
+
+  // In-place PR / scope switch onto a target holding an unsent draft (#1590):
+  // its new items are merged straight into the session (no blocking banner),
+  // re-checked against the diff now on screen, and autosave then saves the
+  // merge under the new target. Reassigned every render so it always sees
+  // the switched-to diff.
+  const draftTargetMergeRef = useRef<(items: CodeDraftMergeItems) => void>(() => {});
+  draftTargetMergeRef.current = (items) => {
+    const merged = prMetadata
+      ? reanchorCodeAnnotations(items.annotations, files, {
+          currentSnapshot: snapshotId,
+          patchChanged: items.patchChanged,
+          belongsToCurrentDiff: (a) => annotationMatchesPrScope(a, prMetadata.url, prDiffScope),
+        })
+      : items.annotations;
+    if (merged.length > 0) {
+      annotationsRef.current = [...annotationsRef.current, ...merged];
+      setAnnotations(annotationsRef.current);
+    }
+    if (items.descriptionAnnotations.length > 0) setDescriptionAnnotations((prev) => [...prev, ...items.descriptionAnnotations]);
+    if (items.commentAnnotations.length > 0) setCommentAnnotations((prev) => [...prev, ...items.commentAnnotations]);
+    const count = merged.length + items.descriptionAnnotations.length + items.commentAnnotations.length;
+    toast.success(`Restored ${count} unsent comment${count === 1 ? '' : 's'} for this ${mrLabel}`);
+  };
 
   const handleRestoreDraft = useCallback(() => {
     reviewHistory.clear();
     const restored = restoreDraft();
-    if (restored.annotations.length > 0) setAnnotations(restored.annotations);
+    // PR mode (#1590): re-check restored line comments against the diff on
+    // screen. When the server served the draft for a different patch, every
+    // in-scope line comment is verified (unstamped ones included); otherwise
+    // only comments stamped with another snapshot are. Mismatches are marked
+    // outdated, never dropped or moved. Local reviews restore untouched.
+    const restoredAnnotations = prMetadata
+      ? reanchorCodeAnnotations(restored.annotations, files, {
+          currentSnapshot: snapshotId,
+          patchChanged: restored.patchChanged,
+          belongsToCurrentDiff: (a) => annotationMatchesPrScope(a, prMetadata.url, prDiffScope),
+        })
+      : restored.annotations;
+    if (restoredAnnotations.length > 0) setAnnotations(restoredAnnotations);
     if (restored.descriptionAnnotations.length > 0) setDescriptionAnnotations(restored.descriptionAnnotations);
     if (restored.commentAnnotations.length > 0) setCommentAnnotations(restored.commentAnnotations);
-    if (restored.viewedFiles.length > 0) setViewedFiles(new Set(restored.viewedFiles));
+    // After a push, a file the reviewer marked Viewed may have changed since.
+    const restoredViewed = restorableViewedFiles(restored.viewedFiles, restored.patchChanged, files);
+    if (restoredViewed.length > 0) setViewedFiles(new Set(restoredViewed));
     if (restored.autoViewSuppressed.length > 0) setAutoViewSuppressed(new Set(restored.autoViewSuppressed));
-  }, [restoreDraft, reviewHistory]);
+  }, [restoreDraft, reviewHistory, files, prMetadata, prDiffScope, snapshotId]);
+
+  // PR mode (#1590): whenever the diff on screen changes (push picked up,
+  // layer/full-stack switch, in-place PR switch back), re-check line comments
+  // stamped with a different snapshot. Those whose anchor still matches are
+  // re-stamped; the rest become outdated. Also remembers the latest layer
+  // snapshot per PR, which is what may be posted inline on that PR.
+  const knownPrSnapshotsRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    if (!prMetadata || !snapshotId) return;
+    if (prDiffScope !== 'full-stack') knownPrSnapshotsRef.current.set(prMetadata.url, snapshotId);
+    const next = reanchorCodeAnnotations(annotationsRef.current, files, {
+      currentSnapshot: snapshotId,
+      belongsToCurrentDiff: (a) => annotationMatchesPrScope(a, prMetadata.url, prDiffScope),
+    });
+    if (next !== annotationsRef.current) {
+      annotationsRef.current = next;
+      setAnnotations(next);
+    }
+  }, [snapshotId, files, prMetadata, prDiffScope]);
 
   // Agent Instructions — copy a clipboard payload teaching external agents
   // (Claude Code, Codex, etc.) how to POST review comments into this session
@@ -1046,7 +1136,7 @@ const ReviewApp: React.FC = () => {
     setGuideHintActive(false);
   }, [guideOpen, guideHintActive]);
   // One-time Edit Mode (edit-to-suggest) announcement. LAST in the dialog
-  // chain (guide intro → look-and-feel → review setup → edit mode) — the
+  // chain (guide intro → look-and-feel → edit mode) — the
   // chain dialogs never stack. Skipped forever when the user already enabled
   // the setting from Settings (latched at mount so enabling from the dialog
   // itself doesn't unmount it mid-click).
@@ -1058,7 +1148,6 @@ const ReviewApp: React.FC = () => {
     isLoading,
     guideIntroVisible,
     lookAndFeelVisible: showLookAndFeel,
-    reviewSetupVisible: showReviewSetup,
   });
   const dismissEditModeIntro = useCallback(() => {
     markEditModeAnnouncementSeen();
@@ -1069,7 +1158,7 @@ const ReviewApp: React.FC = () => {
     setEditModeIntroPending(false);
   }, []);
   // One-time token hover card announcement. LAST in the dialog chain (guide
-  // intro → look-and-feel → review setup → edit mode → token hover) — the
+  // intro → look-and-feel → edit mode → token hover) — the
   // chain dialogs never stack. Latched at mount so choosing a trigger inside
   // the dialog does not unmount it mid-click; a user who already has a
   // non-default trigger never sees it (resolveTokenHoverAnnouncementPending).
@@ -1084,6 +1173,18 @@ const ReviewApp: React.FC = () => {
   // WRITE, so it belongs here rather than in the state initializer above.
   useEffect(() => {
     if (shouldConsumeTokenHoverAnnouncement()) markTokenHoverAnnouncementSeen();
+  }, []);
+  // One-time terminal-tools announcement (Plannotator TUI + Herdr Annotate).
+  // LAST in the dialog chain, after every dialog that asks the reviewer to
+  // decide something. Latched at mount like its siblings: the dismiss writes
+  // the cookie, and re-reading it per render would unmount the dialog under
+  // its own click handler.
+  const [terminalToolsIntroPending, setTerminalToolsIntroPending] = useState(
+    needsTerminalToolsAnnouncement,
+  );
+  const dismissTerminalToolsIntro = useCallback(() => {
+    markTerminalToolsAnnouncementSeen();
+    setTerminalToolsIntroPending(false);
   }, []);
   const aiChat = useAIChat({
     patch: diffData?.rawPatch ?? '',
@@ -1465,7 +1566,8 @@ const ReviewApp: React.FC = () => {
   const activeCommitContext = useMemo(() => {
     const sha = commitShaFromMode(activeDiffBase);
     if (!sha) return null;
-    return { sha, subject: commitInfo?.sha === sha ? commitInfo.subject : undefined };
+    const info = commitInfo?.sha === sha ? commitInfo : null;
+    return { sha, subject: info?.subject, shortId: info?.shortSha };
   }, [activeDiffBase, commitInfo]);
   const activeGitButlerContext = useMemo(() => {
     if (!activeDiffBase.startsWith('gitbutler:')) return null;
@@ -1476,7 +1578,11 @@ const ReviewApp: React.FC = () => {
       snapshotId,
     };
   }, [activeDiffBase, diffData?.gitRef, committedBase, snapshotId]);
-  const canUseLiveWorkspaceActions = !activeDiffBase.startsWith('gitbutler:stack:') &&
+  // A static patch has no working tree at all, so everything that reads one —
+  // open-in-app, code navigation, token hover cards, editor annotations —
+  // is off for the same reason a committed GitButler layer turns them off.
+  const canUseLiveWorkspaceActions = !isStaticPatch &&
+    !activeDiffBase.startsWith('gitbutler:stack:') &&
     !activeDiffBase.startsWith('gitbutler:branch:');
   const visibleEditorAnnotations = useMemo(
     () => canUseLiveWorkspaceActions ? editorAnnotations : [],
@@ -1514,8 +1620,23 @@ const ReviewApp: React.FC = () => {
     featureAvailable: tokenHoverAvailable === true,
     guideIntroVisible,
     lookAndFeelVisible: showLookAndFeel,
-    reviewSetupVisible: showReviewSetup,
     editModeVisible: editModeIntroVisible,
+  });
+  // LAST in the first-run dialog chain: it asks for no decision, so it waits
+  // behind every dialog that does. terminalToolsAnnouncementCanShow explains
+  // why last rather than first.
+  const terminalToolsIntroVisible = terminalToolsAnnouncementCanShow({
+    announcementPending: terminalToolsIntroPending,
+    isLoading,
+    // The code review editor has no archive or shared-session mode; the
+    // portable guide viewer never mounts this App.
+    readOnlySession: false,
+    compact: isCompactTouchLayout,
+    otherFirstRunDialogVisible:
+      guideIntroVisible
+      || showLookAndFeel
+      || editModeIntroVisible
+      || tokenHoverIntroVisible,
   });
   const hoveredTokenSymbol = tokenHover.hover?.request.symbol;
   const startTokenHover = tokenHover.onTokenHoverEnter;
@@ -1565,6 +1686,8 @@ const ReviewApp: React.FC = () => {
     prStackInfo ? prDiffScope : undefined,
     activeCommitContext,
     activeGitButlerContext,
+    files,
+    snapshotId,
   );
 
   // Context rule shared by both auto-open effects below (and mirrored by
@@ -1986,6 +2109,8 @@ const ReviewApp: React.FC = () => {
         agentCwd?: string | null;
         sharingEnabled?: boolean;
         approvalNotesSupported?: boolean;
+        imagePreviewSupported?: boolean;
+        sourceKind?: ReviewSourceKind;
         repoInfo?: { display: string; branch?: string };
         prMetadata?: PRMetadata;
         prStackInfo?: PRStackInfo | null;
@@ -2004,6 +2129,7 @@ const ReviewApp: React.FC = () => {
         commitInfo?: CommitDiffInfo;
         generatedFiles?: string[];
         baseBehindRemote?: boolean;
+        openStatePinned?: boolean;
         snapshotId?: string;
         serverConfig?: Record<string, unknown> & { displayName?: string; gitUser?: string };
       }) => {
@@ -2045,6 +2171,10 @@ const ReviewApp: React.FC = () => {
         if (data.agentCwd !== undefined) setAgentCwd(data.agentCwd);
         if (data.sharingEnabled !== undefined) setSharingEnabled(data.sharingEnabled);
         setApprovalNotesSupported(readApprovalNotesAdvert(data.approvalNotesSupported));
+        setImagePreviewSupported(data.imagePreviewSupported === true);
+        // Session-constant: a static patch session has no diff-type switch to
+        // re-advertise it on, so `/api/diff` is the only place it can arrive.
+        setSourceKind(data.sourceKind === 'patch' ? 'patch' : 'vcs');
         if (data.repoInfo) setRepoInfo(data.repoInfo);
         updatePRSession({
           ...(data.prMetadata && { prMetadata: data.prMetadata }),
@@ -2070,29 +2200,7 @@ const ReviewApp: React.FC = () => {
         setCommitInfo(data.commitInfo ?? null);
         setGeneratedFiles(new Set(data.generatedFiles ?? []));
         setBaseBehindRemote(data.baseBehindRemote === true);
-        // First-run: offer the review-view chooser for a plain local git
-        // session (not workspace/PR/jj/p4), once. An unseen reviewer's panel
-        // is initialized to Tree while inheriting the resolved diff default;
-        // the seen gate leaves returning reviewers' persisted and last-used
-        // views untouched. The user's explicit choice in the dialog then
-        // sticks. Applied to the live session on dismiss.
-        //
-        // Only when since-base is actually AVAILABLE (base ref resolves). On a
-        // repo where getGitContext omits it (trunk / no origin/HEAD), forcing
-        // since-base would degrade to HEAD and hide committed work — the exact
-        // case the offering guard avoids. There, leave the default alone and
-        // don't show the chooser. Matches the sectionsCapable gate used for the
-        // header-menu reopen.
-        const sinceBaseAvailable = !!data.gitContext?.diffOptions?.some(
-          (o: { id: string }) => o.id === 'since-base',
-        );
-        if (
-          data.gitContext && data.mode !== 'workspace' && !data.prMetadata &&
-          data.gitContext.vcsType === 'git' && sinceBaseAvailable && initializeReviewSetup()
-        ) {
-          reviewSetupIsFirstRun.current = true;
-          setShowReviewSetup(true);
-        }
+        setOpenStatePinned(data.openStatePinned === true);
       })
       .catch(() => {
         // Not in API mode - use demo content
@@ -2485,7 +2593,7 @@ const ReviewApp: React.FC = () => {
     // (not lost) behind the guide takeover or a first-run dialog — the file
     // still marks and the next auto-view retries the toast.
     if (!needsAutoViewedNotice()) return;
-    if (guideOpen || guideIntroVisible || showLookAndFeel || showReviewSetup || editModeIntroVisible || tokenHoverIntroVisible) return;
+    if (guideOpen || guideIntroVisible || showLookAndFeel || editModeIntroVisible || tokenHoverIntroVisible || terminalToolsIntroVisible) return;
     markAutoViewedNoticeSeen();
     toast('Files are marked viewed as you scroll', {
       description: "Scroll past a file or move on to the next and it's checked off. Turn this off in Settings → Git, or from the gear above the file list.",
@@ -2505,13 +2613,13 @@ const ReviewApp: React.FC = () => {
         },
       },
     });
-  }, [guideOpen, guideIntroVisible, showLookAndFeel, showReviewSetup, editModeIntroVisible, tokenHoverIntroVisible]);
+  }, [guideOpen, guideIntroVisible, showLookAndFeel, editModeIntroVisible, tokenHoverIntroVisible, terminalToolsIntroVisible]);
   const { handleReadingFileChange: handleAutoViewReadingFile, handleFileScrolledPast } = useAutoViewed({
     enabled: autoViewedEnabled,
     // Rule 4 — only the review target. The guide takeover CSS-hides the dock
     // (so its files are not what the reviewer is reading), and a commit diff
     // is a documented session-only detour, not the change under review.
-    suspended: guideOpen || activeDiffBase.startsWith('commit:'),
+    suspended: guideOpen || !!commitShaFromMode(activeDiffBase),
     viewedFiles,
     suppressedFiles: autoViewSuppressed,
     onMark: markFilesViewed,
@@ -2538,9 +2646,7 @@ const ReviewApp: React.FC = () => {
   // toggling back to Sections switches the diff back to since-base.
   const sectionsCapable = !prMetadata && reviewMode !== 'workspace'
     && !!gitContext?.diffOptions?.some(option => option.id === 'since-base');
-  const activeCommitSha = activeDiffBase.startsWith('commit:')
-    ? activeDiffBase.slice('commit:'.length)
-    : null;
+  const activeCommitSha = commitShaFromMode(activeDiffBase) ?? null;
 
   // The view actually RENDERED for the current selection — a latent
   // 'sections'/'commits' selection the session can't offer resolves to the
@@ -2643,14 +2749,20 @@ const ReviewApp: React.FC = () => {
     callFlow?: CallFlowAdvert;
     agentCwd?: string | null;
     approvalNotesSupported?: boolean;
+    imagePreviewSupported?: boolean;
+    draftState?: CodeDraftTargetState;
   }) {
     const isPRSwitch = !!data.prMetadata;
     setSnapshotId(data.snapshotId);
+    // In-place PR / scope switch (#1590): the draft target moved. Adopt the
+    // new target's generation floor and offer any draft it holds.
+    adoptDraftTarget(data.draftState);
     // Keep the approval-notes advert in lockstep with whatever payload the
     // client last applied — the servers echo it on the PR family too.
     if (data.approvalNotesSupported !== undefined) {
       setApprovalNotesSupported(readApprovalNotesAdvert(data.approvalNotesSupported));
     }
+    if (data.imagePreviewSupported !== undefined) setImagePreviewSupported(data.imagePreviewSupported === true);
     const nextFiles = parseDiffToFiles(data.rawPatch);
     dockApi?.getPanel(REVIEW_DIFF_PANEL_ID)?.api.close();
     needsInitialDiffPanel.current = true;
@@ -2757,6 +2869,7 @@ const ReviewApp: React.FC = () => {
         generatedFiles?: string[];
         baseBehindRemote?: boolean;
         approvalNotesSupported?: boolean;
+        imagePreviewSupported?: boolean;
         superseded?: boolean;
       };
 
@@ -2778,6 +2891,7 @@ const ReviewApp: React.FC = () => {
       if (data.approvalNotesSupported !== undefined) {
         setApprovalNotesSupported(readApprovalNotesAdvert(data.approvalNotesSupported));
       }
+      if (data.imagePreviewSupported !== undefined) setImagePreviewSupported(data.imagePreviewSupported === true);
 
       const nextFiles = orderFilesBySections(parseDiffToFiles(data.rawPatch), data.sections);
       // Rule 5 of auto-mark-viewed: a checkmark on content that has since
@@ -2821,6 +2935,13 @@ const ReviewApp: React.FC = () => {
         // If the current file was removed (whitespace-only), retarget the
         // dock panel to the first remaining file.
         setDiffData(prev => prev ? { ...prev, rawPatch: data.rawPatch, gitRef: data.gitRef, aiReviewContext: data.aiReviewContext } : prev);
+        // A jj revision rewritten since it was opened (editing `@`) comes back
+        // as its successor's jj-commit id: adopt it, or the next refresh would
+        // ask for the frozen id again and the rail could not mark the row.
+        if (isCommitDiffType(data.diffType) && data.diffType !== fullDiffType) {
+          setDiffType(data.diffType);
+          setDiffData(prev => prev ? { ...prev, diffType: data.diffType } : prev);
+        }
         if (data.diffOptions) setWorkspaceDiffOptions(data.diffOptions);
         // Adopt the server's base even on in-place refreshes: the staleness
         // Refresh and post-Fetch paths both preserveFile, and they're exactly
@@ -2876,6 +2997,8 @@ const ReviewApp: React.FC = () => {
             defaultBranch: data.gitContext!.defaultBranch,
             diffOptions: data.gitContext!.diffOptions,
             compareTarget: data.gitContext!.compareTarget,
+            diffAvailability: data.gitContext!.diffAvailability,
+            diffFallback: data.gitContext!.diffFallback,
             jjEvologs: data.gitContext!.jjEvologs,
             // HEAD differs per worktree, so refresh the commit-baseline picker.
             recentCommits: data.gitContext!.recentCommits,
@@ -2937,7 +3060,7 @@ const ReviewApp: React.FC = () => {
   // mode is active, switch the LIVE diff back along with the view. No writes
   // to the persisted view/diff pair: the toggle only records the last-used
   // memo (via selectPanelView), so there is no pair to keep consistent here
-  // (Settings and the setup dialog, which do persist, enforce the
+  // (Settings, which does persist, enforces the
   // sections ⟺ since-base coupling via the shared setters in
   // config/reviewView).
   const handleSwitchToSections = useCallback(() => {
@@ -3003,9 +3126,13 @@ const ReviewApp: React.FC = () => {
     // and the switch itself (going through handleDiffSwitch would compose it
     // a second time in a second place — fragile duplication for no benefit;
     // its evolog base handling never applies to commit diffs).
-    const fullDiffType = activeWorktreePath
-      ? `worktree:${activeWorktreePath}:commit:${sha}`
-      : `commit:${sha}`;
+    // A jj session opens the jj family (the git provider owns `commit:`, and
+    // a pure jj repo has no git work tree to run it in); jj has no worktrees.
+    const fullDiffType = commitsVcs === 'jj'
+      ? `jj-commit:${sha}`
+      : activeWorktreePath
+        ? `worktree:${activeWorktreePath}:commit:${sha}`
+        : `commit:${sha}`;
     if (fullDiffType === diffType) {
       openAllFilesPanel();
       return;
@@ -3022,7 +3149,7 @@ const ReviewApp: React.FC = () => {
       preCommitDiffRef.current = { diffType, base: selectedBase };
     }
     void fetchDiffSwitch(fullDiffType);
-  }, [activeWorktreePath, diffType, selectedBase, fetchDiffSwitch, openAllFilesPanel]);
+  }, [activeWorktreePath, commitsVcs, diffType, selectedBase, fetchDiffSwitch, openAllFilesPanel]);
 
   // The Commits-view session machine (log + poll + HEAD auto-select + center
   // veil) lives in the hook so its invariants stay in one file; App supplies
@@ -3048,6 +3175,11 @@ const ReviewApp: React.FC = () => {
   // session default once, on load only — a commit diff the USER opens later
   // in this session must never be snapped, hence the one-shot ref that burns
   // on the first settled load regardless of what it observed.
+  //
+  // Deliberately NOT gated on openStatePinned: `--diff-type` does not accept
+  // commit:<sha> in v1, so a pinned session can never be serving a commit
+  // diff on load. If v1.1 ever adds commit:<sha> to the accepted open states,
+  // this snap-back would clobber the flag — re-gate it then.
   const snappedCommitDiffOnLoad = useRef(false);
   useEffect(() => {
     if (snappedCommitDiffOnLoad.current || isLoading || !diffData) return;
@@ -3072,23 +3204,31 @@ const ReviewApp: React.FC = () => {
   // diff default (cookie + config.json), and bring the live session along.
   // Keyed to persistedPanelView, NEVER the live panelView: the header toggle
   // is session-only and must not be able to trigger a settings write, even
-  // indirectly through this repair. Only a pair that Settings / the setup
-  // dialog / an old config file actually PERSISTED conflicted gets healed.
+  // indirectly through this repair. Only a pair that Settings or an old config
+  // file actually PERSISTED conflicted gets healed — a reviewer who never
+  // chose a view has no persisted value and is never touched.
   const healedPanelPairOnLoad = useRef(false);
   useEffect(() => {
     if (healedPanelPairOnLoad.current || isLoading || !diffData) return;
-    // First-run resets + applies the pair itself (on dialog dismiss).
-    if (!sectionsCapable || reviewSetupIsFirstRun.current) return;
-    if (persistedPanelView !== 'sections') return;
+    // shouldRepairPanelPair bails ENTIRELY for a caller-pinned session (not
+    // just the diff-switch leg): the repair's other half is a config.json
+    // write, and a flagged session must not cause a settings write it would
+    // not otherwise cause.
+    if (
+      !shouldRepairPanelPair({
+        openStatePinned,
+        sectionsCapable,
+        persistedPanelView,
+        defaultDiffType: configStore.get('defaultDiffType'),
+      })
+    ) return;
     healedPanelPairOnLoad.current = true;
-    if (configStore.get('defaultDiffType') !== 'since-base') {
-      // Re-assert the pair through the coupled setter (repairs cookie +
-      // config.json), then bring the live session along. This is a repair,
-      // not a user choice — it must not overwrite the last-used memo.
-      setReviewPanelView('sections', { recordLastUsed: false });
-      if (activeDiffBase !== 'since-base') void handleDiffSwitch('since-base');
-    }
-  }, [isLoading, diffData, sectionsCapable, persistedPanelView, activeDiffBase, handleDiffSwitch]);
+    // Re-assert the pair through the coupled setter (repairs cookie +
+    // config.json), then bring the live session along. This is a repair,
+    // not a user choice — it must not overwrite the last-used memo.
+    setReviewPanelView('sections', { recordLastUsed: false });
+    if (activeDiffBase !== 'since-base') void handleDiffSwitch('since-base');
+  }, [isLoading, diffData, sectionsCapable, persistedPanelView, activeDiffBase, handleDiffSwitch, openStatePinned]);
 
   // Switch worktree context (or back to main repo). Preserves the current
   // diff mode across the switch — if the reviewer was looking at "PR Diff"
@@ -3103,7 +3243,7 @@ const ReviewApp: React.FC = () => {
   const handleWorktreeSwitch = useCallback(async (worktreePath: string | null) => {
     if (worktreePath === activeWorktreePath) return;
     let carriedBase = activeDiffBase;
-    if (activeDiffBase.startsWith('commit:')) {
+    if (commitShaFromMode(activeDiffBase)) {
       const preferred = configStore.get('defaultDiffType');
       const options = gitContext?.diffOptions ?? [];
       carriedBase = options.some((o) => o.id === preferred)
@@ -3135,7 +3275,9 @@ const ReviewApp: React.FC = () => {
   // user refreshes when THEY are ready — never automatically (annotations are
   // line-anchored; rug-pulling the diff under them is worse than staleness).
   const diffFreshness = useDiffFreshness({
-    enabled: !!origin,
+    // Static patch: the bytes are the session. Nothing can go stale, so the
+    // probe would only poll an endpoint with no fingerprint to compare.
+    enabled: !!origin && !isStaticPatch,
     resetKey: diffData?.rawPatch ?? '',
     snapshotId,
     onAgentCwd: setAgentCwd,
@@ -3390,8 +3532,20 @@ const ReviewApp: React.FC = () => {
     // Call-Flow-native feedback has no honest inline diff destination. Return
     // it to the analysis surface instead of opening an unrelated file row and
     // issuing a scroll request that cannot resolve.
-    if (annotation.callFlowTargets?.length && (annotation.scope ?? 'line') !== 'line') {
+    const navigation = annotationNavigation(annotation);
+    if (navigation === 'call-flow') {
       openCallFlowPanel();
+      setSelectedAnnotationId(id);
+      return;
+    }
+    // Outdated comments (#1590) are not drawn on the diff, so a scroll target
+    // could never resolve: open the file when it is still in the diff and
+    // select the card, without a dead scroll request.
+    if (navigation === 'select-file') {
+      if (!guideOpen && !isAllFilesActiveRef.current) {
+        const fileIndex = files.findIndex(f => f.path === annotation.filePath);
+        if (fileIndex !== -1) handleFileSwitch(fileIndex);
+      }
       setSelectedAnnotationId(id);
       return;
     }
@@ -3430,6 +3584,7 @@ const ReviewApp: React.FC = () => {
             base: committedBase ?? undefined,
             worktreePath: activeWorktreePath,
             commitSubject: activeCommitContext?.subject,
+            commitShortId: activeCommitContext?.shortId,
             snapshotId,
           },
     [prMetadata, activeDiffBase, committedBase, activeWorktreePath, activeCommitContext, snapshotId],
@@ -3479,7 +3634,12 @@ const ReviewApp: React.FC = () => {
     prDiffScope,
     agentCwd,
     canUseLiveWorkspaceActions,
-    allAnnotations,
+    contextExpansionAvailable: !isStaticPatch,
+    imagePreviewAvailable: imagePreviewSupported && !isStaticPatch,
+    snapshotId,
+    // Outdated comments (#1590) carry line numbers from an earlier version of
+    // the PR: they stay in the sidebar and the export, never on the diff.
+    allAnnotations: diffAnnotations,
     externalAnnotations,
     selectedAnnotationId,
     scrollTargetAnnotation,
@@ -3489,7 +3649,8 @@ const ReviewApp: React.FC = () => {
     onAddCallFlowAnnotation: handleAddCallFlowAnnotation,
     onAddAnnotation: handleAddAnnotation,
     onAddAnnotationForFile: handleAddAnnotationForFile,
-    editSuggestionsEnabled,
+    // Edit Mode reads and writes the file on disk; a static patch has none.
+    editSuggestionsEnabled: editSuggestionsEnabled && !isStaticPatch,
     onAddSuggestionsForFile: handleAddSuggestionsForFile,
     onAddEditorCommentForFile: handleAddEditorCommentForFile,
     onAddFileComment: handleAddFileComment,
@@ -3588,8 +3749,8 @@ const ReviewApp: React.FC = () => {
   }), [
     files, diffData?.rawPatch, activeFileIndex, guideOpen, effectiveDiffStyle, handleDiffStyleChange, isCompactTouchLayout, diffOverflow, diffIndicators,
     diffLineDiffType, diffShowLineNumbers, diffShowBackground,
-    diffExpandUnchanged, diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext, prReviewScopeLabel, prDiffScope, agentCwd, canUseLiveWorkspaceActions,
-    allAnnotations, externalAnnotations,
+    diffExpandUnchanged, diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext, prReviewScopeLabel, prDiffScope, agentCwd, canUseLiveWorkspaceActions, isStaticPatch, imagePreviewSupported, snapshotId,
+    diffAnnotations, externalAnnotations,
     visibleDescriptionAnnotations, selectedDescriptionAnnotationId, handleAddDescriptionAnnotation,
     handleSelectDescriptionAnnotation, handleDeleteDescriptionAnnotation, handleAskAIForDescription,
     visibleCommentAnnotations, selectedCommentAnnotationId, handleAddCommentAnnotation,
@@ -3935,7 +4096,7 @@ const ReviewApp: React.FC = () => {
   }, [compactComposerItem, compactConfirmItem, compactDecisionComposer, compactDecisionConfirm]);
 
   // Submit reviews to one or more PRs via /api/pr-action
-  const handlePlatformAction = useCallback(async (action: 'approve' | 'comment', plan: ReviewSubmission, generalComment?: string) => {
+  const handlePlatformAction = useCallback(async (action: PRReviewAction, plan: ReviewSubmission, generalComment?: string) => {
     setIsPlatformActioning(true);
     setPlatformActionError(null);
 
@@ -3962,7 +4123,7 @@ const ReviewApp: React.FC = () => {
           prNumber: prMetadata ? (prMetadata.platform === 'github' ? prMetadata.number : prMetadata.iid) : 0,
           prTitle: prMetadata?.title ?? '',
           prRepo: prMetadata ? getDisplayRepo(prMetadata) : '',
-          fileComments: [], fileScopedBody: '',
+          fileComments: [], fileLevelComments: [], fileScopedBody: '',
           fileCount: 0, annotationCount: 0, status: 'pending' as const,
         }];
       }
@@ -4010,12 +4171,17 @@ const ReviewApp: React.FC = () => {
       const prLinks = openUrls.join(', ');
       const statusMessage = action === 'approve'
         ? `${mrLabel === 'MR' ? 'Merge request' : 'Pull request'} approved on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`
-        : `${mrLabel === 'MR' ? 'Merge request' : 'Pull request'} reviewed on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`;
+        : action === 'request_changes' && prMetadata.platform === 'github'
+          ? `Changes requested on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`
+          : `${mrLabel === 'MR' ? 'Merge request' : 'Pull request'} reviewed on ${platformLabel}${prLinks ? ': ' + prLinks : ''}`;
       fetch('/api/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         keepalive: true,
         body: JSON.stringify({
+          // Tombstones the draft (and its PR target key) at this generation,
+          // like the agent-path decisions, so no late autosave revives it.
+          draftGeneration: getDraftGeneration(),
           approved: false,
           feedback: statusMessage,
           annotations: [],
@@ -4027,16 +4193,16 @@ const ReviewApp: React.FC = () => {
     } finally {
       setIsPlatformActioning(false);
     }
-  }, [platformOpenPR, platformLabel, mrLabel, prMetadata]);
+  }, [platformOpenPR, platformLabel, mrLabel, prMetadata, getDraftGeneration]);
 
-  const openPlatformDialog = useCallback((action: 'approve' | 'comment') => {
+  const openPlatformDialog = useCallback((action: PRReviewAction, chooseEvent = false) => {
     const diffPaths = new Set(files.map(f => f.path));
     const prMeta = prMetadata ? {
       number: prMetadata.platform === 'github' ? prMetadata.number : prMetadata.iid,
       title: prMetadata.title,
       repo: getDisplayRepo(prMetadata),
     } : undefined;
-    const plan = buildReviewSubmission(allAnnotations, visibleEditorAnnotations, prMetadata?.url, diffPaths, prMeta);
+    const plan = buildReviewSubmission(allAnnotations, visibleEditorAnnotations, prMetadata?.url, diffPaths, prMeta, knownPrSnapshotsRef.current, prMetadata?.platform);
     // PR description/comment notes aren't line-anchored, so they can't post as
     // inline review comments — seed them into the review body instead (quoted),
     // where the user can edit before submitting. Also means a review with only
@@ -4064,11 +4230,15 @@ const ReviewApp: React.FC = () => {
       setPlatformCommentDialog({
         action: recovery.action,
         plan: restoreReviewSubmission(plan, recovery),
+        // A retained Request changes submission shows its (locked) event
+        // choice, so the reviewer sees which event the retry carries; the
+        // comment and approve recoveries render exactly as before.
+        chooseEvent: recovery.action === 'request_changes',
       });
       return;
     }
     setPlatformGeneralComment(seededGeneralComment);
-    setPlatformCommentDialog({ action, plan });
+    setPlatformCommentDialog({ action, plan, chooseEvent });
   }, [allAnnotations, visibleEditorAnnotations, files, prMetadata, visibleDescriptionAnnotations, visibleCommentAnnotations, prContext?.body, platformReviewRecovery]);
 
   // --- PR6 (§3.4): platform mode adopts the control's SHAPE ----------------
@@ -4077,8 +4247,9 @@ const ReviewApp: React.FC = () => {
   // open" toggle — untouched), whose general-comment textarea stays the only
   // note field on this side. `approvalNotesSupported` is irrelevant here —
   // the platform posts to the forge API natively — so approve items gate
-  // only on self-authorship, muted rather than removed (Request changes… /
-  // Post comments, then… stay live; no state is a dead end).
+  // only on self-authorship, muted rather than removed. On GitHub, Request
+  // changes… mutes on your own PR too (#1611) and a live "Comment…" row takes
+  // its place, so no state is a dead end.
   const busyWithPlatformDecision = busyWithDecision || isPlatformActioning;
 
   const platformDecisionSpec = useMemo(() => buildDecisionSpec({
@@ -4087,8 +4258,8 @@ const ReviewApp: React.FC = () => {
     count: totalAnnotationCount,
     hasFeedback: totalAnnotationCount > 0,
     approvalNotesSupported: false, // ignored by the platform arm
-    platform: { label: platformLabel, mrLabel, selfAuthored: isOwnPR },
-  }), [totalAnnotationCount, platformLabel, mrLabel, isOwnPR]);
+    platform: { label: platformLabel, mrLabel, selfAuthored: isOwnPR, requestChangesSupported },
+  }), [totalAnnotationCount, platformLabel, mrLabel, isOwnPR, requestChangesSupported]);
 
   const runPlatformDecisionAction = useCallback((id: DecisionActionId) => {
     if (submitted || busyWithPlatformDecision) return;
@@ -4101,9 +4272,9 @@ const ReviewApp: React.FC = () => {
     // any future caller included) — resolve the mute from the live spec, not
     // from whichever surface fired.
     if (platformDecisionSpec.items.some((item) => item.id === id && item.muted)) return;
-    const mode = resolvePlatformDecisionAction(id, totalAnnotationCount > 0);
-    if (mode) openPlatformDialog(mode);
-  }, [busyWithPlatformDecision, openPlatformDialog, platformDecisionSpec, submitted, totalAnnotationCount]);
+    const mode = resolvePlatformDecisionAction(id, totalAnnotationCount > 0, requestChangesSupported);
+    if (mode) openPlatformDialog(mode.action, mode.chooseEvent);
+  }, [busyWithPlatformDecision, openPlatformDialog, platformDecisionSpec, submitted, totalAnnotationCount, requestChangesSupported]);
 
   const platformDecisionHandlers = useMemo<Record<DecisionActionId, DecisionHandler>>(() => ({
     'primary': () => runPlatformDecisionAction('primary'),
@@ -4159,7 +4330,7 @@ const ReviewApp: React.FC = () => {
     if (event.defaultPrevented || isNativeHistoryOwner(event)) return false;
     if (submitted || isSendingFeedback || isApproving || isExiting || isPlatformActioning || isLoadingDiff) return false;
     if (guideOpen || openSettingsMenu || showDestinationMenu || platformCommentDialog || showExportModal || showWorktreeDialog || showNoAnnotationsDialog || showExitWarning) return false;
-    if (showLookAndFeel || showGuideIntro || showReviewSetup || editModeIntroVisible || tokenHoverIntroVisible || tourDialogJobId) return false;
+    if (showLookAndFeel || showGuideIntro || editModeIntroVisible || tokenHoverIntroVisible || terminalToolsIntroVisible || tourDialogJobId) return false;
     return !hasActiveHistoryOverlay(document);
   }, [
     guideOpen,
@@ -4170,6 +4341,7 @@ const ReviewApp: React.FC = () => {
     isSendingFeedback,
     editModeIntroVisible,
     tokenHoverIntroVisible,
+    terminalToolsIntroVisible,
     openSettingsMenu,
     platformCommentDialog,
     showDestinationMenu,
@@ -4179,7 +4351,6 @@ const ReviewApp: React.FC = () => {
     showWorktreeDialog,
     showGuideIntro,
     showLookAndFeel,
-    showReviewSetup,
     submitted,
     tourDialogJobId,
   ]);
@@ -4319,6 +4490,16 @@ const ReviewApp: React.FC = () => {
 
   const compactActionBusy = isSendingFeedback || isApproving || isExiting || isPlatformActioning;
   const showsLocalVsRemoteEmptyState = activeDiffBase === 'local-vs-remote';
+  // Static patch header identity: the patch path the caller passed (or
+  // "stdin patch"), which the server echoes as gitRef. Never a branch or repo.
+  const staticPatchSource = (diffData?.gitRef ?? '').trim();
+  const staticPatchLabel = staticPatchSource
+    ? staticPatchSource.split(/[\\/]/).pop() || staticPatchSource
+    : 'Patch';
+  // Distinguishes "valid patch, nothing in it" from "these bytes are not a
+  // unified diff" for the empty state. The server already refuses a
+  // whitespace-only patch at startup, so anything reaching here has content.
+  const patchHasDiffHeaders = /^(diff --git |--- |\+\+\+ |@@ |Index: )/m.test(diffData?.rawPatch ?? '');
   const compactReviewActions: CompactReviewAction[] = !isCompactTouchLayout
     ? []
     : !origin
@@ -4351,7 +4532,7 @@ const ReviewApp: React.FC = () => {
               disabled: compactActionBusy || !!platformDecisionSpec.primary.muted,
             },
             ...platformDecisionSpec.items.map((item) => ({
-              id: compactRowIdForReviewDecisionItem(item.id),
+              id: compactRowIdForPlatformDecisionItem(item.id),
               label: item.label,
               subtitle: item.subtitle,
               onSelect: () => runPlatformDecisionAction(item.id),
@@ -4528,6 +4709,23 @@ const ReviewApp: React.FC = () => {
                   <RepoIcon className="w-3 h-3 flex-shrink-0" />
                   {repoInfo.display}
                 </span>
+              </div>
+            ) : isStaticPatch ? (
+              // Honest label for a repo-less session: name the patch that IS
+              // the review, never a branch or repo this process happens to
+              // sit in.
+              <div className={isCompactTouchLayout
+                ? 'min-w-0 flex items-center justify-center overflow-hidden px-1'
+                : 'min-w-0 flex flex-1 items-center gap-2 overflow-hidden'
+              }>
+                <span
+                  className="text-xs font-mono text-foreground truncate max-w-[220px]"
+                  title={staticPatchSource || 'Static patch review'}
+                  data-testid="static-patch-label"
+                >
+                  {staticPatchLabel}
+                </span>
+                <span className="text-xs text-muted-foreground/60 hidden sm:inline">Patch</span>
               </div>
             ) : (
               <span className={isCompactTouchLayout
@@ -4868,7 +5066,6 @@ const ReviewApp: React.FC = () => {
 
             <ReviewHeaderMenu
               onOpenSettings={() => setOpenSettingsMenu(true)}
-              onOpenReviewSetup={sectionsCapable ? () => { reviewSetupIsFirstRun.current = false; setShowReviewSetup(true); } : undefined}
               onOpenExport={() => setShowExportModal(true)}
               onCopyAgentInstructions={handleCopyAgentInstructions}
               onToggleFileTree={toggleNavigator}
@@ -4936,6 +5133,31 @@ const ReviewApp: React.FC = () => {
               </button>
             </div>
           ) : null
+        )}
+
+        {gitContext?.diffFallback && (
+          <div className="shrink-0 border-b border-warning/20 bg-warning/10 px-3 py-2 text-xs text-warning">
+            <div>{gitContext.diffFallback.message}</div>
+            {!!gitContext.diffFallback.candidates?.length && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {gitContext.diffFallback.candidates.map((candidate) => (
+                  <button
+                    key={candidate.revision}
+                    type="button"
+                    className="rounded border border-warning/30 bg-background/50 px-2 py-1 text-left hover:bg-background"
+                    title={candidate.subject || candidate.revision}
+                    onClick={() => {
+                      setSelectedBase(candidate.revision);
+                      void fetchDiffSwitch(gitContext.diffFallback!.requestedDiffType, candidate.revision, { explicitBase: true });
+                    }}
+                  >
+                    {candidate.labels[0] ?? candidate.revision.slice(0, 8)}
+                    {candidate.subject && <span className="ml-1 text-muted-foreground">· {candidate.subject}</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         )}
 
         {/* Main content */}
@@ -5030,6 +5252,7 @@ const ReviewApp: React.FC = () => {
                 onRetry={commitsView.refresh}
                 onSelectPanelView={handlePanelViewSelect}
                 showSectionsOption={sectionsCapable}
+                headLabel={commitsVcs === 'jj' ? '@' : 'HEAD'}
               />
             </ReviewNavigatorContainer>
           )}
@@ -5218,7 +5441,7 @@ const ReviewApp: React.FC = () => {
                         <p className="text-xs text-muted-foreground mt-1">
                           {activeDiffBase === 'since-base' && `No changes since ${selectedBase || gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''} — committed, uncommitted, or untracked.`}
                           {showsLocalVsRemoteEmptyState && `Your local branch matches its remote-tracking branch${activeWorktreePath ? ' in this worktree' : ''}.`}
-                          {activeDiffBase.startsWith('commit:') && 'This commit has no changes.'}
+                          {commitShaFromMode(activeDiffBase) && 'This commit has no changes.'}
                           {activeDiffBase === 'uncommitted' && `No uncommitted changes${activeWorktreePath ? ' in this worktree' : ' to review'}.`}
                           {activeDiffBase === 'staged' && "No staged changes. Stage some files with git add."}
                           {activeDiffBase === 'unstaged' && "No unstaged changes. All changes are staged."}
@@ -5238,6 +5461,9 @@ const ReviewApp: React.FC = () => {
                           {activeDiffBase === 'branch' && `No changes vs ${selectedBase || gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''}.`}
                           {activeDiffBase === 'merge-base' && `No changes vs ${selectedBase || gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''}.`}
                           {activeDiffBase === 'all' && `No tracked files${activeWorktreePath ? ' in this worktree' : ' in this repository'}.`}
+                          {isStaticPatch && (patchHasDiffHeaders
+                            ? 'The patch contains no changes.'
+                            : 'The patch could not be parsed as a unified diff.')}
                         </p>
                       </>
                     )}
@@ -5269,6 +5495,7 @@ const ReviewApp: React.FC = () => {
                 onSelectAnnotation={handleSelectAnnotation}
                 onNavigateToAnnotation={handleNavigateToAnnotation}
                 onDeleteAnnotation={handleDeleteAnnotation}
+                onEditAnnotationText={handleEditAnnotation}
                 onAddGeneralComment={handleAddGeneralComment}
                 feedbackMarkdown={feedbackMarkdown}
                 width={isCompactTouchLayout ? undefined : panelResize.width}
@@ -5488,32 +5715,9 @@ const ReviewApp: React.FC = () => {
           />
         )}
 
-        {/* First-run review-view chooser (panel view + tree default diff).
-            Third in the dialog chain (guide intro → look-and-feel → review
-            setup → edit mode) so the chain dialogs never stack. On dismiss,
-            apply the chosen default to the current session. */}
-        {showReviewSetup && !showLookAndFeel && !guideIntroVisible && (
-          <ReviewSetupDialog
-            isOpen
-            onDismiss={() => {
-              markReviewSetupSeen();
-              setShowReviewSetup(false);
-              // Apply the chosen default to the live session ONLY on first run.
-              // A reopen from the header menu is a glance — it must not yank the
-              // user's mid-session diff selection back to the default.
-              if (!reviewSetupIsFirstRun.current) return;
-              reviewSetupIsFirstRun.current = false;
-              const chosen = configStore.get('defaultDiffType');
-              if (chosen && chosen !== activeDiffBase && !prMetadata && reviewMode !== 'workspace') {
-                void handleDiffSwitch(chosen);
-              }
-            }}
-          />
-        )}
-
         {/* One-time Edit Mode (edit-to-suggest) announcement. LAST in the
-            dialog chain (guide intro → look-and-feel → review setup
-            → edit mode) — editModeAnnouncementCanShow gates on every earlier dialog, so the
+            dialog chain (guide intro → look-and-feel → edit mode) —
+            editModeAnnouncementCanShow gates on every earlier dialog, so the
             chain dialogs never stack. */}
         {editModeIntroVisible && (
           <EditModeAnnouncementDialog
@@ -5523,20 +5727,28 @@ const ReviewApp: React.FC = () => {
           />
         )}
 
-        {/* One-time token hover card announcement. LAST in the dialog chain
-            (guide intro → look-and-feel → review setup → edit mode → token
-            hover) — tokenHoverAnnouncementCanShow gates on every earlier
+        {/* One-time token hover card announcement. Fourth in the dialog chain
+            (guide intro → look-and-feel → edit mode → token hover → terminal
+            tools) — tokenHoverAnnouncementCanShow gates on every earlier
             dialog, so the chain dialogs never stack. */}
         {tokenHoverIntroVisible && (
           <TokenHoverAnnouncementDialog isOpen onDismiss={dismissTokenHoverIntro} />
         )}
 
+        {/* One-time Plannotator TUI + Herdr Annotate announcement. LAST in the
+            dialog chain (guide intro → look-and-feel → edit mode → token hover
+            → terminal tools) — terminalToolsAnnouncementCanShow gates on every
+            earlier dialog, so the chain dialogs never stack. */}
+        {terminalToolsIntroVisible && (
+          <TerminalToolsAnnouncementDialog isOpen onDismiss={dismissTerminalToolsIntro} />
+        )}
+
         {/* One-time PR feedback-destination spotlight. Strictly AFTER the
-            first-run dialog chain (guide intro → look-and-feel → review
-            setup → edit mode → token hover): it only mounts once none of the five is
-            showing, so it never stacks with them. PR mode only — the switcher
-            it points at doesn't render otherwise. */}
-        {showDestSpotlight && !isCompactTouchLayout && !!prMetadata && !isLoading && !showLookAndFeel && !guideIntroVisible && !showReviewSetup && !editModeIntroVisible && !tokenHoverIntroVisible && (
+            first-run dialog chain (guide intro → look-and-feel → edit mode →
+            token hover → terminal tools): it only mounts once none of the five
+            is showing, so it never stacks with them. PR mode only — the
+            switcher it points at doesn't render otherwise. */}
+        {showDestSpotlight && !isCompactTouchLayout && !!prMetadata && !isLoading && !showLookAndFeel && !guideIntroVisible && !editModeIntroVisible && !tokenHoverIntroVisible && !terminalToolsIntroVisible && (
           <DestinationSpotlight
             targetRef={destToggleRef}
             platformLabel={platformLabel}
@@ -5572,6 +5784,10 @@ const ReviewApp: React.FC = () => {
         <ReviewSubmissionDialog
           isOpen={!!platformCommentDialog}
           action={platformCommentDialog?.action ?? 'comment'}
+          onActionChange={platformCommentDialog?.chooseEvent
+            ? (next) => setPlatformCommentDialog(prev => prev ? { ...prev, action: next } : prev)
+            : undefined}
+          requestChangesUnavailableReason={requestChangesUnavailableReason}
           submission={platformCommentDialog?.plan ?? { targets: [], orphans: [] }}
           generalComment={platformGeneralComment}
           onGeneralCommentChange={setPlatformGeneralComment}

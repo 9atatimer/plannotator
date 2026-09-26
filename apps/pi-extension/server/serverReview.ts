@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
+import { likelyAppHtmlEncoding, prewarmAppHtml } from "../generated/app-html.ts";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import os from "node:os";
 import { basename, resolve as resolvePath } from "node:path";
 
 import { SingleFlight } from "../generated/single-flight.ts";
-import { contentHash, deleteDraft } from "../generated/draft.ts";
-import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveSharingEnabled, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGuideShareUrl } from "../generated/config.ts";
+import { contentHash } from "../generated/draft.ts";
+import { createReviewDraftSession, prDraftTargetKey, type ReviewDraftKeys } from "../generated/review-draft.ts";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseReviewAnalysisConfig, resolveAIEnabled, resolveSharingEnabled, resolveCursorSandbox, resolveFeedbackHistory, resolveGuideHistory, resolveGuideShareUrl, resolveGitRemoteCheck } from "../generated/config.ts";
 import { appendFeedbackRecord, countChangedFiles, deriveFeedbackProject, type FeedbackDecision, type FeedbackReviewTarget } from "../generated/feedback-archive.ts";
 import { isFaviconStyle, type FaviconStyle } from "../generated/favicon.ts";
 
@@ -44,23 +46,42 @@ import {
 	type RemoteDefaultInfo,
 	type SinceBaseSections,
 	detectRemoteDefaultInfo,
+	nextRemoteBaseCheckInterval,
+	REMOTE_BASE_CHECK_INTERVAL_MS,
 	getFileContentsForDiff as getFileContentsForDiffCore,
+	getFileBytesForDiff as getFileBytesForDiffCore,
+	type DiffSide,
+	type FileBytesRead,
 	getSinceBaseSections,
 	isBinaryPatchFile,
+	commitFamilyId,
 	isSameCwdCommitSwitch,
 	listPatchFiles,
+	STATIC_PATCH_DIFF_TYPE,
 	parseCommitDiffType,
+	parseJjCommitDiffType,
 	parseWorktreeDiffType,
 	resolveBaseBranch,
 	validateFilePath,
 } from "../generated/review-core.ts";
 import {
+	REVIEW_IMAGE_ENDPOINT,
+	REVIEW_IMAGE_READ_CONCURRENCY,
+	createConcurrencyLimiter,
+	handleReviewImageRequest,
+	readPRImageSide,
+} from "../generated/review-image.ts";
+import {
 	getGitButlerContextRevision,
 	getGitButlerPatchFingerprint,
 } from "../generated/gitbutler-core.ts";
+import { canonicalizeJjCommitDiffType } from "../generated/jj-core.ts";
 import {
 	getCommitDiffInfo,
+	getJjCommitDiffInfo,
 	listCommitHistory,
+	listJjCommitHistory,
+	resolveJjCommitRailBase,
 	type CommitDiffInfo,
 } from "../generated/commit-history.ts";
 import {
@@ -84,7 +105,7 @@ import { createAgentJobHandler, whichCmd as commandExists } from "./agent-jobs.t
 import { type AgentJobInfo, REVIEW_OUTPUT_FAILED, getAgentJobAnnotationContext, markJobReviewFailed } from "../generated/agent-jobs.ts";
 import { createExternalAnnotationHandler } from "./external-annotations.ts";
 import {
-	handleDraftRequest,
+	handleReviewDraftRequest,
 	handleFavicon,
 	handleImageRequest,
 	readDraftGenerationFromBody,
@@ -101,11 +122,14 @@ import {
 	fetchPR,
 	fetchPRContext,
 	fetchPRFileContent,
+	fetchPRFileBytes,
 	fetchPRList,
 	fetchPRStack,
 	fetchPRViewedFiles,
 	getPRUser,
 	markPRFilesViewed,
+	parseFileLevelComments,
+	parsePRReviewAction,
 	parsePRUrl,
 	prCommandRuntime,
 	submitPRReview,
@@ -190,7 +214,10 @@ import {
 	getVcsContext,
 	getVcsDiffFingerprint,
 	getVcsFileContentsForDiff,
+	getVcsFileBytesForDiff,
+	jjRuntime,
 	resolveVcsCwd,
+	resolveAvailableDiffType,
 	reviewRuntime,
 	materializeVcsSnapshot,
 	runVcsDiff,
@@ -295,6 +322,20 @@ export async function startReviewServer(options: {
 	 * the patch that's already on screen.
 	 */
 	initialBase?: string;
+	/**
+	 * The caller pinned `initialBase` deliberately (a `--base` flag / an
+	 * explicit programmatic choice), not merely as the base its initial patch
+	 * happened to use. Seeds `baseExplicitlyChosen`: canonicalization off,
+	 * startup upgrade suppressed. Additive and opt-in — plain
+	 * forward-the-local-name-and-let-it-upgrade callers are unchanged.
+	 */
+	initialBaseExplicit?: boolean;
+	/**
+	 * The caller pinned this session's opening diff type and/or base (CLI
+	 * flags). Echoed on `/api/diff` so the client must not auto-switch the
+	 * diff on mount, and must not self-heal the persisted panel-view pair.
+	 */
+	openStatePinned?: boolean;
 	/** Freshness token captured atomically with the initial provider patch. */
 	initialFingerprint?: string;
 	error?: string;
@@ -313,6 +354,8 @@ export async function startReviewServer(options: {
 	prMetadata?: PRMetadata;
 	/** Platform review writer override used by isolated runtime tests. */
 	prReviewSubmitter?: typeof submitPRReview;
+	/** In-place PR switch fetcher override used by isolated runtime tests. */
+	prFetcher?: typeof fetchPR;
 	/**
 	 * The initial layer patch is missing per-file content (platform APIs
 	 * withhold patches on very large PRs). Enables the local recompute upgrade
@@ -334,6 +377,12 @@ export async function startReviewServer(options: {
 	workspace?: WorkspaceReviewSession;
 	/** Per-PR worktree pool. When set, pr-switch creates worktrees instead of checking out. */
 	worktreePool?: WorktreePool;
+	/**
+	 * `false` when the caller passed `review --no-git-remote-check` (issue #1553).
+	 * Highest-priority input to `resolveGitRemoteCheck`; `undefined` leaves
+	 * PLANNOTATOR_GIT_REMOTE_CHECK / config.gitRemoteCheck to decide.
+	 */
+	gitRemoteCheck?: boolean;
 	/** Cleanup callback invoked when server stops (e.g., remove temp worktree) */
 	onCleanup?: () => void | Promise<void>;
 	/** Called when server starts with the URL, remote status, and port */
@@ -415,7 +464,12 @@ export async function startReviewServer(options: {
 			// Non-fatal: viewed state is best-effort
 		}
 	}
-	let repoInfo = prMeta
+	// Static patch: the session has no repository. Whatever repo the process
+	// happens to sit in is NOT the patch's origin, and advertising it would put
+	// an unrelated repo and branch in the review header.
+	let repoInfo = options.diffType === STATIC_PATCH_DIFF_TYPE
+		? undefined
+		: prMeta
 		? {
 				display: getDisplayRepo(prMeta),
 				branch: `${getMRLabel(prMeta)} ${getMRNumberLabel(prMeta)}`,
@@ -435,6 +489,14 @@ export async function startReviewServer(options: {
 	let originalPRGitRef = options.gitRef;
 	let originalPRError = options.error;
 	let currentPRDiffScope: PRDiffScope = "layer";
+	// Draft keys for the diff on screen (#1590), mirroring the Bun server:
+	// patch key only outside PR mode (unchanged behavior), plus the PR's stable
+	// target key in PR mode. Read late — a PR switch or scope change moves both.
+	const reviewDrafts = createReviewDraftSession();
+	const currentDraftKeys = (): ReviewDraftKeys => ({
+		patchKey: draftKey,
+		targetKey: isPRMode && prMeta ? prDraftTargetKey(prMeta, currentPRDiffScope) : null,
+	});
 	// Monotonic guard for PR scope/switch state writes. Scope requests now park
 	// on long awaits (checkout warmup, full recompute) — a request that resumed
 	// after a NEWER scope select or pr-switch must not overwrite their state.
@@ -459,8 +521,9 @@ export async function startReviewServer(options: {
 	// switch body). Disables the bare-local-name → origin/* canonicalization:
 	// the picker offers local and remote refs as distinct choices, so an
 	// explicit local pick must be honored even when the two point at
-	// different commits.
-	let baseExplicitlyChosen = false;
+	// different commits. A caller-pinned base (`--base` via
+	// initialBaseExplicit) seeds it for the same reason.
+	let baseExplicitlyChosen = options.initialBaseExplicit === true;
 	const resolveReviewBase = (
 		requestedBase?: string,
 		explicitlyChosen = baseExplicitlyChosen,
@@ -587,9 +650,21 @@ export async function startReviewServer(options: {
 	let remoteDefaultInfo: RemoteDefaultInfo | null = null;
 	let baseBehindRemote = false;
 	let lastRemoteBaseCheck = 0;
-	const REMOTE_BASE_CHECK_INTERVAL_MS = 60_000;
-	const remoteBaseCheckApplies = (): boolean =>
+	// Interval policy (base cadence + failure backoff) is shared with the Bun
+	// runtime in review-core so the two cannot drift.
+	let remoteBaseCheckIntervalMs = REMOTE_BASE_CHECK_INTERVAL_MS;
+	// Session-wide opt-out (#1553): `--no-git-remote-check`, PLANNOTATOR_GIT_REMOTE_CHECK,
+	// or `{ "gitRemoteCheck": false }`. Resolved ONCE so a config edit mid-session
+	// cannot start network traffic the user opted out of at launch.
+	const remoteCheckEnabled = resolveGitRemoteCheck(options.gitRemoteCheck === false, loadConfig());
+	// Session shape: a plain local git review, so a remote base exists to talk
+	// about at all. Kept separate from the opt-out because an EXPLICIT Fetch is
+	// the user asking for the network — the opt-out is about the automatic
+	// probes, so `/api/fetch-base` stays reachable with the remote check off.
+	const gitRemoteSessionApplies = (): boolean =>
 		!!options.gitContext && !isPRMode && (!sessionVcsType || sessionVcsType === "git");
+	const remoteBaseCheckApplies = (): boolean =>
+		remoteCheckEnabled && gitRemoteSessionApplies();
 
 	// Only base-relative diff types (since-base / branch / merge-base) care
 	// about the base being behind the remote; the banner must not show under
@@ -649,12 +724,19 @@ export async function startReviewServer(options: {
 		if (!remoteBaseCheckApplies()) return;
 		lastRemoteBaseCheck = Date.now();
 		remoteDefaultInfo = await detectRemoteDefaultInfo(reviewRuntime, options.gitContext?.cwd);
+		// Negative caching (#1553): detectRemoteDefaultInfo returns null for
+		// every failure mode, so back off on failure and reset the moment the
+		// remote answers again.
+		remoteBaseCheckIntervalMs = nextRemoteBaseCheckInterval(
+			remoteBaseCheckIntervalMs,
+			remoteDefaultInfo !== null,
+		);
 		await recomputeBaseBehindRemote();
 	}
 
 	function maybeRefreshRemoteBaseInfo(): void {
 		if (!remoteBaseCheckApplies()) return;
-		if (Date.now() - lastRemoteBaseCheck < REMOTE_BASE_CHECK_INTERVAL_MS) return;
+		if (Date.now() - lastRemoteBaseCheck < remoteBaseCheckIntervalMs) return;
 		lastRemoteBaseCheck = Date.now();
 		void refreshRemoteBaseInfo().catch(() => {});
 	}
@@ -678,9 +760,12 @@ export async function startReviewServer(options: {
 		if (isPRMode || workspace || !options.gitContext) return undefined;
 		const effective = parseWorktreeDiffType(diffType)?.subType ?? diffType;
 		const sha = parseCommitDiffType(effective as string)?.sha;
-		if (!sha) return undefined;
+		const jjCommitId = parseJjCommitDiffType(effective as string)?.commitId;
+		if (!sha && !jjCommitId) return undefined;
 		const cwd = resolveVcsCwd(diffType as DiffType, options.gitContext.cwd);
-		const info = await getCommitDiffInfo(reviewRuntime, sha, cwd);
+		const info = jjCommitId
+			? await getJjCommitDiffInfo(jjRuntime, jjCommitId, cwd)
+			: await getCommitDiffInfo(reviewRuntime, sha!, cwd);
 		if (!info) return undefined;
 		const avatars = await commitAvatars.resolve(cwd, [info.authorEmail]);
 		const avatarUrl = avatars.get(info.authorEmail);
@@ -738,13 +823,21 @@ export async function startReviewServer(options: {
 	// leaving currentBase as bare "main" makes the "behind GitHub" banner
 	// un-clearable (Fetch advances origin/main, not local main). Canonicalizing
 	// "main" -> "origin/main" never overrides a deliberately-chosen feature base.
-	if (options.gitContext && !isPRMode) {
+	//
+	// Skipped entirely when the remote check is off (#1553):
+	// detectRemoteDefaultCompareTarget itself runs an ls-remote, so the opt-out
+	// would not be honest if only the staleness probe were suppressed. The base
+	// then stays whatever local ref discovery resolved.
+	if (options.gitContext && !isPRMode && remoteCheckEnabled) {
 		const gitCwd = options.gitContext.cwd;
 		detectRemoteDefaultCompareTarget(gitCwd, sessionVcsType).then(
 			async (remote) => {
 				if (remote && !baseEverSwitched && currentBase !== remote) {
 					const localName = remote.replace(/^origin\//, "");
-					if (!options.initialBase || currentBase === localName) {
+					// An explicitly-pinned base (`--base main`) means the LOCAL ref
+					// on purpose — never upgrade it, even when it is the default's
+					// bare local name. Unpinned forwarded local names keep upgrading.
+					if (!options.initialBaseExplicit && (!options.initialBase || currentBase === localName)) {
 						// Rebuild the diff for the upgraded base BEFORE swapping it in, and
 						// commit base+patch+ref+fingerprint together — otherwise the initial
 						// patch (built against the old base) would be served under the new
@@ -1405,7 +1498,7 @@ export async function startReviewServer(options: {
 					?? await guideStore.captureLaunchContext();
 				// The review this guide describes, for portable export (decision
 				// record D6). Mirrors packages/server/review.ts.
-				const commitSha = parseCommitDiffType(String(worktreeParts?.subType ?? launchDiffType))?.sha;
+				const commitSha = commitFamilyId(String(launchDiffType)) ?? undefined;
 				const launchSource: GuideSnapshotSource = workspacePrompt
 					? { kind: "workspace", ...(repoInfo?.display && { repo: repoInfo.display }) }
 					: launchPrMeta
@@ -1485,8 +1578,8 @@ export async function startReviewServer(options: {
 			// appends the marker-block output contract (even for a custom profile —
 			// it's the only thing that makes their prose output parseable). The
 			// engine's buildArgv passes the prompt as the trailing positional arg and
-			// threads the spawn cwd (--workspace for Cursor, --dir for OpenCode; Pi has
-			// no cwd flag — it always uses the process's actual cwd, which spawnJob
+			// threads the spawn cwd (--workspace for Cursor; OpenCode (#1609) and Pi have
+			// no cwd flag — they use the process's actual cwd, which spawnJob
 			// already sets from this same cwd).
 			// captureStdout is required: the marker block comes back on stdout NDJSON.
 			const markerEngine = MARKER_ENGINES[provider as MarkerEngineId];
@@ -1705,6 +1798,20 @@ export async function startReviewServer(options: {
 	// Session-constant capability advert; rides every diff payload (see the
 	// option's doc). Absent option = false, so old callers advertise honestly.
 	const approvalNotesSupported = options.approvalNotesSupported === true;
+	// Static patch mode (`--patch-file`): caller-supplied diff bytes, no repo,
+	// no working tree. Advertised as `sourceKind: "patch"` on every diff payload
+	// (absent reads as "vcs") and enforced by 400ing the endpoints that would
+	// otherwise resolve the patch's paths against an unrelated cwd. Mirrors
+	// packages/server/review.ts.
+	const isStaticPatchMode = options.diffType === STATIC_PATCH_DIFF_TYPE;
+	// Image preview capability advert (#1598), beside approvalNotesSupported on
+	// every diff payload. Off where nothing can be read: a static patch has
+	// no repository, and P4 drops binary files from its patch entirely.
+	const imagePreviewSupported = !isStaticPatchMode;
+	const runImageRead = createConcurrencyLimiter(REVIEW_IMAGE_READ_CONCURRENCY);
+	const sourceKindAdvert = isStaticPatchMode
+		? ({ sourceKind: "patch" } as const)
+		: ({} as Record<string, never>);
 	const shareBaseUrl =
 		(options.shareBaseUrl ?? process.env.PLANNOTATOR_SHARE_URL) || undefined;
 	const pasteApiUrl =
@@ -2067,7 +2174,7 @@ export async function startReviewServer(options: {
 				snapshotId: servedSnapshotId,
 				origin: options.origin ?? "pi",
 				mode: isWorkspaceMode ? "workspace" : undefined,
-				diffType: hasLocalAccess || isWorkspaceMode ? servedDiffType : undefined,
+				diffType: hasLocalAccess || isWorkspaceMode || isStaticPatchMode ? servedDiffType : undefined,
 				// Echo the active base so page refresh/reconnect rehydrates the
 				// picker to what the server is actually using, not the detected default.
 				base: hasLocalAccess ? servedBase : undefined,
@@ -2076,6 +2183,11 @@ export async function startReviewServer(options: {
 				gitContext: hasLocalAccess ? servedGitContext : undefined,
 				sharingEnabled,
 				approvalNotesSupported,
+				imagePreviewSupported,
+				...sourceKindAdvert,
+				// Mount is the only place the pin matters, so it rides /api/diff
+				// alone (not the switch endpoints).
+				...(options.openStatePinned && { openStatePinned: true }),
 				shareBaseUrl,
 				pasteApiUrl,
 				repoInfo,
@@ -2112,7 +2224,7 @@ export async function startReviewServer(options: {
 		} else if (url.pathname === "/api/fetch-base" && req.method === "POST") {
 			// Fetch the remote default branch so the local baseline catches up
 			// with GitHub. Client re-runs /api/diff/switch afterwards.
-			if (!remoteBaseCheckApplies()) {
+			if (!gitRemoteSessionApplies()) {
 				json(res, { error: "Not available in this mode" }, 400);
 				return;
 			}
@@ -2135,7 +2247,9 @@ export async function startReviewServer(options: {
 			// Re-query the remote (fresh ls-remote) and recompute rather than
 			// trusting a cached tip: a narrow fetch refspec can exit 0 without
 			// advancing refs/remotes/origin/<branch>, so we must observe the
-			// actual post-fetch state instead of silently clearing the banner.
+			// actual post-fetch state instead of silently clearing the banner. With
+			// the remote check off (#1553) this is a no-op, which is consistent:
+			// that session never shows the banner in the first place.
 			await refreshRemoteBaseInfo();
 			json(res, { ok: true, baseBehindRemote });
 		} else if (url.pathname === "/api/diff/fresh" && req.method === "GET") {
@@ -2179,7 +2293,15 @@ export async function startReviewServer(options: {
 				return;
 			}
 			const fresh = probe == null || probe === baseline;
-			maybeRefreshRemoteBaseInfo();
+			// Deliberately NO maybeRefreshRemoteBaseInfo() here (#1553). This
+			// endpoint is polled every 5s for as long as the page is open, so
+			// hanging the 60s remote probe off it made an idle review contact the
+			// remote once a minute forever — one hardware-key touch prompt per
+			// minute on a smartcard-backed SSH setup, with no visible UI activity.
+			// The remote is now queried on the interactions that can change the
+			// answer: startup, /api/diff, /api/diff/switch (the Refresh button and
+			// the base/diff pickers) and the explicit Fetch. `baseBehindRemote`
+			// still rides every response below, from the cached value.
 			// The probe fingerprint lets the client distinguish "still the same
 			// staleness I dismissed" from "ANOTHER change landed since".
 			json(res, {
@@ -2301,20 +2423,37 @@ export async function startReviewServer(options: {
 			}
 		} else if (url.pathname === "/api/commits" && req.method === "GET") {
 			// Linear commit history for the Commits panel (mirrors Bun review.ts).
-			// Git-local sessions only — PR/workspace/jj/p4 don't offer the view.
-			// Computed against the active diff's cwd (worktree-aware) and the
-			// active base so the divider matches the review baseline.
-			if (!options.gitContext || isPRMode || workspace || (sessionVcsType && sessionVcsType !== "git")) {
-				json(res, { error: "Commit history is only available for local git reviews" }, 400);
+			// Local git and jj sessions only — PR/workspace/GitButler/p4 don't
+			// offer the view. Computed against the active diff's cwd
+			// (worktree-aware) and the active base so the divider matches the
+			// review baseline (jj: the compare target, resolveJjCommitRailBase).
+			const commitsVcs = sessionVcsType ?? "git";
+			if (!options.gitContext || isPRMode || workspace || (commitsVcs !== "git" && commitsVcs !== "jj")) {
+				json(res, { error: "Commit history is only available for local git and jj reviews" }, 400);
 				return;
 			}
 			const limitParam = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
 			const before = url.searchParams.get("before") ?? undefined;
 			const commitsCwd = resolveVcsCwd(currentDiffType as DiffType, options.gitContext.cwd);
-			const page = await listCommitHistory(reviewRuntime, currentBase, commitsCwd, {
+			const pageOptions = {
 				...(Number.isFinite(limitParam) && { limit: limitParam }),
 				...(before !== undefined && { before }),
-			});
+			};
+			let page;
+			try {
+				if (commitsVcs === "jj") {
+					const railBase = resolveJjCommitRailBase(currentBase, clientGitContext ?? options.gitContext);
+					page = await listJjCommitHistory(jjRuntime, railBase.target, commitsCwd, {
+						...pageOptions,
+						baseLabel: railBase.label,
+					});
+				} else {
+					page = await listCommitHistory(reviewRuntime, currentBase, commitsCwd, pageOptions);
+				}
+			} catch (err) {
+				json(res, { error: err instanceof Error ? err.message : "Could not read commit history" }, 500);
+				return;
+			}
 			if (!page) {
 				json(res, { error: "Could not read commit history" }, 500);
 				return;
@@ -2335,13 +2474,19 @@ export async function startReviewServer(options: {
 			// finish out of arrival order under network jitter, so capturing after
 			// parseBody let a slow-body OLDER request overwrite a newer one.
 			const switchEpoch = ++diffSwitchEpoch;
+			// The remote probe moved here from the 5s freshness poll (#1553).
+			// This endpoint backs the diff-type and base pickers AND the
+			// "Diff out of date · Refresh" button, so it fires when the reviewer
+			// asks for a fresh answer rather than on a timer. Fire-and-forget: a
+			// hanging remote must never make a diff switch wait on the network.
+			maybeRefreshRemoteBaseInfo();
 			if (!hasLocalAccess && !workspace) {
 				json(res, { error: "Not available without local file access" }, 400);
 				return;
 			}
 			try {
 				const body = await parseBody(req);
-				const newType = body.diffType as DiffType | WorkspaceDiffType;
+				let newType = body.diffType as DiffType | WorkspaceDiffType;
 				if (typeof newType !== "string" || !newType) {
 					json(res, { error: "Missing diffType" }, 400);
 					return;
@@ -2376,6 +2521,8 @@ export async function startReviewServer(options: {
 						gitRef: currentGitRef,
 						snapshotId: currentSnapshotId(),
 						approvalNotesSupported,
+						imagePreviewSupported,
+						...sourceKindAdvert,
 						diffType: currentDiffType,
 						diffOptions: workspace.diffOptions,
 						hideWhitespace: currentHideWhitespace,
@@ -2396,6 +2543,16 @@ export async function startReviewServer(options: {
 				// (diff-type switches, refreshes) must not re-canonicalize it.
 				const nextBaseExplicitlyChosen = baseExplicitlyChosen ||
 					(body.explicitBase === true && typeof body.base === "string" && !!body.base);
+				const requestedDiffType = newType as DiffType;
+				const availability = clientGitContext
+					? resolveAvailableDiffType(clientGitContext, requestedDiffType, nextBaseExplicitlyChosen)
+					: { diffType: requestedDiffType };
+				newType = availability.diffType;
+				// Mirrors Bun review.ts: a rewritten jj revision resolves to its
+				// change's current version (Refresh after editing `@`).
+				if (sessionVcsType === "jj") {
+					newType = await canonicalizeJjCommitDiffType(jjRuntime, newType as string, options.gitContext?.cwd) as DiffType;
+				}
 				const base = resolveReviewBase(
 					typeof body.base === "string" ? body.base : undefined,
 					nextBaseExplicitlyChosen,
@@ -2475,8 +2632,34 @@ export async function startReviewServer(options: {
 				baseBehindRemote = nextBaseBehindRemote;
 				currentError = result.error;
 				draftKey = contentHash(currentPatch);
+				// Session-context adoption is provider-scoped: gitbutler (as
+				// before this change) because its stack topology is the
+				// context, and jj so the jj-line availability/fallback stays
+				// fresh across reloads. Plain git keeps the launch-frozen
+				// session context — currentBranch labels the launch cwd in
+				// WorktreePicker and the feedback branch label, and adopting a
+				// switched worktree's recomputed context here would repoint
+				// those on the next reload.
+				const adoptContext =
+					updatedContext !== undefined &&
+					(sessionVcsType === "gitbutler" || sessionVcsType === "jj");
+				const nextClientContext = adoptContext
+					? updatedContext
+					: clientGitContext;
+				if (nextClientContext) {
+					clientGitContext = {
+						...nextClientContext,
+						diffFallback: availability.fallback
+							? {
+								requestedDiffType,
+								effectiveDiffType: newType,
+								message: availability.fallback.message,
+								candidates: availability.fallback.candidates,
+							}
+							: undefined,
+					};
+				}
 				if (updatedContext && sessionVcsType === "gitbutler") {
-					clientGitContext = updatedContext;
 					currentContextRevision = updatedContextRevision ?? "";
 				}
 				captureDiffFingerprint(result.fingerprint);
@@ -2488,6 +2671,8 @@ export async function startReviewServer(options: {
 					gitRef: currentGitRef,
 					snapshotId: currentSnapshotId(),
 					approvalNotesSupported,
+					imagePreviewSupported,
+					...sourceKindAdvert,
 					diffType: currentDiffType,
 					// Echo the base the server actually used. resolveBaseBranch
 					// trusts the caller verbatim; this echo lets the client
@@ -2499,7 +2684,22 @@ export async function startReviewServer(options: {
 					...(commitInfo ? { commitInfo } : {}),
 					...(generatedFiles ? { generatedFiles } : {}),
 					...(baseBehindRemote ? { baseBehindRemote: true } : {}),
-					...(updatedContext ? { gitContext: updatedContext } : {}),
+					// The response still carries a transiently recomputed context
+					// (worktree switches on plain git) even when the session did
+					// not adopt it — matching the pre-jj-line behavior.
+					// Emitted only when a context was actually recomputed: on a
+					// same-cwd commit:<sha> switch (recompute skipped) the client
+					// keeps what it has. Echoing the launch-frozen session context
+					// here would revert the base picker and commit-baseline list
+					// on every Commits-rail click.
+					...(updatedContext
+						? {
+							gitContext: {
+								...updatedContext,
+								diffFallback: clientGitContext?.diffFallback,
+							},
+						}
+						: {}),
 					...(currentError ? { error: currentError } : {}),
 					semanticDiff: switchSemanticDiff,
 					callFlow: switchCallFlow,
@@ -2534,7 +2734,10 @@ export async function startReviewServer(options: {
 						aiReviewContext: buildCurrentAiReviewContext(),
 						gitRef: currentGitRef,
 						snapshotId: currentSnapshotId(),
+						draftState: reviewDrafts.state(currentDraftKeys()),
 						approvalNotesSupported,
+						imagePreviewSupported,
+						...sourceKindAdvert,
 						prDiffScope: currentPRDiffScope,
 						...(layerPatchIncomplete ? { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable } : {}),
 						...(currentError ? { error: currentError } : {}),
@@ -2600,7 +2803,10 @@ export async function startReviewServer(options: {
 						aiReviewContext: buildCurrentAiReviewContext(),
 						gitRef: currentGitRef,
 						snapshotId: currentSnapshotId(),
+						draftState: reviewDrafts.state(currentDraftKeys()),
 						approvalNotesSupported,
+						imagePreviewSupported,
+						...sourceKindAdvert,
 						prDiffScope: currentPRDiffScope,
 						...(layerPatchIncomplete ? { prPatchIncomplete: true, prPatchUpgradeAvailable: layerUpgradeAvailable } : {}),
 						...((currentError ?? upgradeError) ? { error: currentError ?? upgradeError } : {}),
@@ -2640,7 +2846,10 @@ export async function startReviewServer(options: {
 					aiReviewContext: buildCurrentAiReviewContext(),
 					gitRef: currentGitRef,
 					snapshotId: currentSnapshotId(),
+					draftState: reviewDrafts.state(currentDraftKeys()),
 					approvalNotesSupported,
+					imagePreviewSupported,
+					...sourceKindAdvert,
 					prDiffScope: currentPRDiffScope,
 					semanticDiff: await getSemanticDiffAdvert(),
 					callFlow: await getCallFlowAdvert(),
@@ -2661,7 +2870,7 @@ export async function startReviewServer(options: {
 				if (!isSameProject(newRef, prRef!)) return json(res, { error: "Cannot switch to a PR in a different repository" }, 400);
 
 				const cached = prSwitchCache.get(body.url);
-				const pr = cached ?? await fetchPR(newRef);
+				const pr = cached ?? await (options.prFetcher ?? fetchPR)(newRef);
 				if (!cached) prSwitchCache.set(body.url, pr);
 				// Bump the scope epoch so a scope request parked on a long await
 				// cannot overwrite this switch.
@@ -2725,7 +2934,10 @@ export async function startReviewServer(options: {
 					aiReviewContext: buildCurrentAiReviewContext(),
 					gitRef: currentGitRef,
 					snapshotId: currentSnapshotId(),
+					draftState: reviewDrafts.state(currentDraftKeys()),
 					approvalNotesSupported,
+					imagePreviewSupported,
+					...sourceKindAdvert,
 					prMetadata: pr.metadata,
 					// The new PR's checkout (null while warming) so Open-in re-roots
 					// immediately on switch instead of waiting for the 5s probe.
@@ -2850,7 +3062,13 @@ export async function startReviewServer(options: {
 			}
 			try {
 				const body = await parseBody(req);
+				const action = parsePRReviewAction(body.action);
+				if (!action) {
+					json(res, { error: "action must be one of approve, comment, request_changes" }, 400);
+					return;
+				}
 				const fileComments = (body.fileComments as PRReviewFileComment[]) || [];
+				const fileLevelComments = parseFileLevelComments(body.fileLevelComments);
 				const targetPrUrl = body.targetPrUrl as string | undefined;
 
 				let targetRef = prRef;
@@ -2871,13 +3089,14 @@ export async function startReviewServer(options: {
 					return;
 				}
 
-				console.error(`[pr-action] ${body.action} with ${fileComments.length} file comment(s), target=${targetUrl}, headSha=${targetHeadSha}`);
+				console.error(`[pr-action] ${action} with ${fileComments.length} line comment(s) and ${fileLevelComments.length} file-level comment(s), target=${targetUrl}, headSha=${targetHeadSha}`);
 				const submission = await submitPlatformReview(
 					targetRef,
 					targetHeadSha,
-					body.action as "approve" | "comment",
+					action,
 					body.body as string,
 					fileComments,
+					fileLevelComments,
 				);
 				console.error(`[pr-action] ${submission.status === "complete" ? "Success" : "Partial success"}`);
 				prContextLive.refreshAfterWrite(targetUrl, targetRef);
@@ -2915,7 +3134,78 @@ export async function startReviewServer(options: {
 				console.error("[plannotator] /api/pr-viewed error:", message);
 				json(res, { error: message }, 500);
 			}
+		} else if (url.pathname === REVIEW_IMAGE_ENDPOINT && req.method === "GET") {
+			// One side of a changed image, as bytes (#1598). Mirrors
+			// packages/server/review.ts: every decision is in the shared handler;
+			// this closure only says where the current mode reads a side from.
+			const readSide = async (
+				side: DiffSide,
+				filePath: string,
+				oldPath: string | undefined,
+				maxBytes: number,
+				signal?: AbortSignal,
+			): Promise<FileBytesRead> => {
+				if (workspace) return workspace.getFileBytes(filePath, oldPath, side, maxBytes);
+				const prCwd = (options.worktreePool && prMeta) ? options.worktreePool.resolve(prMeta.url) : options.agentCwd;
+				if (isPRMode && currentPRDiffScope === "full-stack" && prCwd && prMeta?.defaultBranch) {
+					const baseRef = await resolvePRFullStackBaseRef(reviewRuntime, prMeta.defaultBranch, prCwd);
+					if (!baseRef) return { kind: "missing" };
+					return getFileBytesForDiffCore(reviewRuntime, "merge-base", baseRef, filePath, oldPath, side, maxBytes, prCwd);
+				}
+				if (hasLocalAccess && !isPRMode) {
+					return getVcsFileBytesForDiff(
+						currentDiffType as DiffType,
+						currentBase,
+						filePath,
+						oldPath,
+						side,
+						maxBytes,
+						options.gitContext?.cwd,
+					);
+				}
+				if (isPRMode && prMeta && prRef) {
+					const ref = prRef;
+					return readPRImageSide({
+						gitRuntime: reviewRuntime,
+						poolCwd: prCwd,
+						oldSha: prMeta.mergeBaseSha ?? prMeta.baseSha,
+						headSha: prMeta.headSha,
+						side,
+						filePath,
+						oldPath,
+						maxBytes,
+						fetchBytes: (sha, path, max) => fetchPRFileBytes(ref, sha, path, max),
+						signal,
+					});
+				}
+				return { kind: "unavailable" };
+			};
+			// node:http has no request signal: abort when the client closes the
+			// socket before the response is written.
+			const requestAbort = new AbortController();
+			res.on("close", () => {
+				if (!res.writableEnded) requestAbort.abort();
+			});
+			const result = await handleReviewImageRequest({
+				params: url.searchParams,
+				ifNoneMatch: typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : null,
+				available: imagePreviewSupported,
+				patch: currentPatch,
+				isCurrentSnapshot: (snapshot) => snapshot === currentSnapshotId(),
+				signal: requestAbort.signal,
+				readSide: (side, filePath, oldPath, maxBytes, signal) =>
+					runImageRead(() => readSide(side, filePath, oldPath, maxBytes, signal), signal),
+			});
+			if (requestAbort.signal.aborted) return;
+			res.writeHead(result.status, result.headers);
+			res.end(result.body ?? undefined);
 		} else if (url.pathname === "/api/file-content" && req.method === "GET") {
+			// No working tree behind a static patch: the patch IS the whole content
+			// of the session, so there is nothing to expand into.
+			if (isStaticPatchMode) {
+				json(res, { error: "File content is unavailable for a static patch review" }, 400);
+				return;
+			}
 			const filePath = url.searchParams.get("path");
 			if (!filePath) {
 				json(res, { error: "Missing path" }, 400);
@@ -3243,6 +3533,10 @@ export async function startReviewServer(options: {
 			}
 			json(res, { instructions: writeGuideInstructions(instructions) });
 		} else if (url.pathname === "/api/git-add" && req.method === "POST") {
+			if (isStaticPatchMode) {
+				json(res, { error: "Staging is unavailable for a static patch review" }, 400);
+				return;
+			}
 			try {
 				const body = await parseBody(req);
 				const filePath = body.filePath as string | undefined;
@@ -3294,6 +3588,13 @@ export async function startReviewServer(options: {
 				json(res, { error: message }, 500);
 			}
 		} else if (url.pathname === "/api/open-in/apps" && req.method === "GET") {
+			// Static patch mode has no tree the patch's paths belong to, so
+			// advertise no apps: the client hides the control rather than offering
+			// to open a same-named file from an unrelated checkout.
+			if (isStaticPatchMode) {
+				json(res, { available: false, apps: [] });
+				return;
+			}
 			// Remote/headless sessions can't open apps on the user's machine —
 			// report unavailable so the UI hides the control entirely.
 			if (isRemote) {
@@ -3304,6 +3605,13 @@ export async function startReviewServer(options: {
 		} else if (url.pathname === "/api/open-in" && req.method === "POST") {
 			if (isGitButlerCommittedView()) {
 				json(res, { error: "Open in app is unavailable for committed GitButler views" }, 400);
+				return;
+			}
+			// A static patch's paths belong to whatever tree produced the patch,
+			// which this process cannot know — resolving them against the session
+			// cwd would open an unrelated file with the same name.
+			if (isStaticPatchMode) {
+				json(res, { ok: false, error: "Open in app is unavailable for a static patch review" }, 400);
 				return;
 			}
 			if (isRemote) {
@@ -3338,7 +3646,7 @@ export async function startReviewServer(options: {
 				);
 			}
 		} else if (url.pathname === "/api/draft") {
-			await handleDraftRequest(req, res, draftKey);
+			await handleReviewDraftRequest(req, res, currentDraftKeys(), reviewDrafts);
 		} else if (url.pathname === "/favicon.png") {
 			handleFavicon(res);
 		} else if (
@@ -3412,7 +3720,7 @@ export async function startReviewServer(options: {
 			// Decision-only line: dismissal rate is behavior data, and a
 			// contentless failure must not change the legacy draft behavior.
 			archiveReviewSubmission("", [], "dismissed");
-			deleteDraft(draftKey, readDraftGenerationFromUrl(req));
+			reviewDrafts.settle(currentDraftKeys(), readDraftGenerationFromUrl(req));
 			resolveDecision({ approved: false, feedback: '', annotations: [], exit: true });
 			json(res, { ok: true });
 		} else if (url.pathname === "/api/feedback" && req.method === "POST") {
@@ -3433,7 +3741,7 @@ export async function startReviewServer(options: {
 					annotationList,
 					approved ? (hasContent ? "approved-with-notes" : "lgtm") : "feedback",
 				);
-				if (durable) deleteDraft(draftKey, readDraftGenerationFromBody(body));
+				if (durable) reviewDrafts.settle(currentDraftKeys(), readDraftGenerationFromBody(body));
 				resolveDecision({
 					approved,
 					feedback: feedbackText,
@@ -3448,11 +3756,14 @@ export async function startReviewServer(options: {
 		} else if (url.pathname.startsWith("/api/")) {
 			handleApiNotFound(res, url.pathname);
 		} else {
-			html(res, options.htmlContent);
+			await html(req, res, options.htmlContent, isRemoteSession());
 		}
 	});
 
 	const { port, portSource } = await listenOnPort(server);
+	// Remote sessions serve the app page compressed (#1617); start gzip (what
+	// browsers ask for over plain http) now so the first load does not wait.
+	if (isRemoteSession()) prewarmAppHtml(options.htmlContent, likelyAppHtmlEncoding(false));
 	serverUrl = buildAdvertisedUrl(port);
 	agentApiUrl = `http://127.0.0.1:${port}`;
 	const exitHandler = () => agentJobs.killAll();

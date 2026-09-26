@@ -8,10 +8,11 @@
  *   PLANNOTATOR_PORT   - Fixed port or inclusive range (default: random locally, 19432 for remote)
  *   PLANNOTATOR_ORIGIN - Explicit origin override; validated against AGENT_CONFIG
  *                        in packages/shared/agents.ts. Supported values:
- *                        "claude-code", "amp", "droid", "kiro-cli", "opencode",
- *                        "codex", "copilot-cli", "gemini-cli", "pi", "oh-my-pi".
+ *                        "claude-code", "amp", "droid", "kiro-cli", "mistral-vibe",
+ *                        "opencode", "codex", "copilot-cli", "gemini-cli", "pi", "oh-my-pi".
  */
 
+import { appHtmlResponse, likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
 import type { Origin } from "@plannotator/shared/agents";
 import { resolve } from "path";
 import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
@@ -643,9 +644,7 @@ export async function startPlannotatorServer(
           }
 
           // Serve embedded HTML for all other routes (SPA)
-          return new Response(htmlContent, {
-            headers: { "Content-Type": "text/html" },
-          });
+          return appHtmlResponse(req, htmlContent, isRemote);
         },
 
         error(err) {
@@ -672,6 +671,10 @@ export async function startPlannotatorServer(
     })();
     return stopPromise;
   };
+
+  // Remote sessions serve the app page compressed (#1617); start the likely
+  // encoding (gzip over plain http) now so the first load does not wait.
+  if (isRemote) prewarmAppHtml(htmlContent, likelyAppHtmlEncoding(false));
 
   // The cache warm must never gate the listening socket. Its async filesystem
   // walk yields between directories while requests remain serviceable.
