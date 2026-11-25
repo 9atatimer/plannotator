@@ -22,7 +22,7 @@ This file is a map. The full guidance lives in focused guides under [`docs/agent
 - **No new Inbox keyboard shortcuts without the owner's approval** (see the Inbox shortcuts note in [Keyboard Shortcuts](docs/agent-guides/guides-and-shared-ui.md#keyboard-shortcuts)). Shortcuts elsewhere go through the shortcut registry.
 - **Git:** never rebase or force-push a shared branch; merge main instead.
 - **No AI attribution.** Commit messages, tags, release notes and PR bodies carry no AI attribution and no session links.
-- **Releases:** follow [`.agents/skills/release/SKILL.md`](.agents/skills/release/SKILL.md).
+- **Releases:** follow [`.agents/skills/release/SKILL.md`](.agents/skills/release/SKILL.md) for publishing. For the local fork binary, merge a published upstream release tag into the fork instead of building upstream main; run the applicable CI checks and an interactive plan review, and preserve the prior binary for rollback before installing the verified build.
 
 ## Topic guides
 
