@@ -21,9 +21,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { useCodeAnnotationDraft } from './hooks/useCodeAnnotationDraft';
+import { localReviewDraftTransport } from '../review-editor/utils/localReviewDraft';
 import { resetDraftTransport, setDraftTransport } from './hooks/useAnnotationDraft';
 import type { CodeAnnotation } from './types';
-import { saveDraft, loadDraft, deleteDraft, getDraftGeneration } from '../shared/draft';
+import { saveDraft, loadDraft, deleteDraft, getDraftGeneration, missingDraftHeaders } from '../shared/draft';
 
 const hasDom = typeof document !== 'undefined';
 
@@ -63,13 +64,7 @@ function installFetchShim() {
         const data = loadDraft(DRAFT_KEY);
         return data
           ? new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } })
-          : new Response(
-              JSON.stringify({
-                found: false,
-                ...(getDraftGeneration(DRAFT_KEY) !== null ? { draftGeneration: getDraftGeneration(DRAFT_KEY) } : {}),
-              }),
-              { status: 404, headers: { 'Content-Type': 'application/json' } },
-            );
+          : new Response(null, { status: 204, headers: missingDraftHeaders(getDraftGeneration(DRAFT_KEY)) });
       }
       if (method === 'POST') {
         saveDraft(DRAFT_KEY, JSON.parse(String(init?.body)));
@@ -167,6 +162,177 @@ async function mountSession(opts: HookOptions): Promise<Session> {
 // ---------------------------------------------------------------------------
 
 describe('code-review annotation draft persistence', () => {
+  for (const priorWrite of [false, true]) {
+    test.skipIf(!hasDom)(`a rejecting flush still allows switching and saving the next target (prior write: ${priorWrite})`, async () => {
+      const attempts: object[] = [];
+      const transportA = {
+        load: async () => ({ data: null, generation: null }),
+        save: async (body: object) => { attempts.push(body); throw new Error('offline'); },
+        remove: async () => {},
+      };
+      const saved: object[] = [];
+      const transportB = { ...transportA, save: async (body: object) => { saved.push(body); } };
+      const s = await mountSession(options({ transport: transportA }));
+      try {
+        if (priorWrite) {
+          await s.rerender(options({ transport: transportA, annotations: [ANNOTATION] }));
+          await tick(DEBOUNCE_WAIT_MS); // leaves an already-rejected in-flight write
+        }
+        const latest = { ...ANNOTATION, text: 'latest edit' };
+        await s.rerender(options({ transport: transportA, annotations: [latest] }));
+        await act(async () => {
+          await s.result.current!.flushBeforeSwitch();
+          s.result.current!.adoptDraftTarget({ found: false, draftGeneration: null }, transportB);
+        });
+        expect(attempts.at(-1)).toMatchObject({ codeAnnotations: [latest] });
+        await s.rerender(options({ transport: transportB, annotations: [latest] }));
+        await tick(DEBOUNCE_WAIT_MS);
+        expect(saved.at(-1)).toMatchObject({ codeAnnotations: [latest] });
+      } finally { await s.unmount(); }
+    });
+  }
+
+  for (const operation of ['initial load', 'target load', 'save'] as const) {
+    test.skipIf(!hasDom)(`a target-mismatch 409 on ${operation} offers recovery and retains comments through an in-place refresh`, async () => {
+      const diskFetch = globalThis.fetch;
+      let activeTarget = operation === 'initial load' ? 'local-other' : 'local-a';
+      let conflicts = 0;
+      globalThis.fetch = (async (input, init) => {
+        const requested = new URL(String(input), 'http://localhost').searchParams.get('target');
+        if (requested !== activeTarget) {
+          conflicts++;
+          return Response.json({ code: 'draft_target_changed', error: 'Review draft target changed' }, { status: 409 });
+        }
+        return diskFetch(input, init);
+      }) as typeof fetch;
+      const transport = localReviewDraftTransport('local-a', 'page-1');
+      const s = await mountSession(options({ transport }));
+      try {
+        const comments = [{ ...ANNOTATION, localReviewTarget: 'local-a' }];
+        activeTarget = 'local-other';
+        if (operation === 'target load') {
+          await act(async () => { s.result.current!.adoptDraftTarget({ found: true, draftGeneration: 7 }, transport); });
+        }
+        await s.rerender(options({ transport, annotations: comments }));
+        await tick(DEBOUNCE_WAIT_MS);
+        expect(s.result.current!.draftTargetChanged).toBe(true);
+        expect(conflicts).toBe(1); // a mismatch is not a transient load failure
+        expect(loadDraft(DRAFT_KEY)).toBeNull(); // never writes into the other target
+
+        // A failed refresh must keep the notice; successful in-place refresh
+        // selects this tab's comparison again without clearing its comments.
+        await act(async () => { s.result.current!.adoptDraftTarget(undefined); });
+        expect(s.result.current!.draftTargetChanged).toBe(true);
+        await act(async () => {
+          await s.result.current!.flushBeforeSwitch();
+          activeTarget = 'local-a';
+          s.result.current!.adoptDraftTarget({ found: false, draftGeneration: 9 }, transport);
+        });
+        await tick(DEBOUNCE_WAIT_MS);
+        expect(s.result.current!.draftTargetChanged).toBe(false);
+        expect(loadDraft(DRAFT_KEY)).toMatchObject({ codeAnnotations: comments, draftGeneration: 10 });
+      } finally {
+        await s.unmount();
+        globalThis.fetch = diskFetch;
+      }
+    });
+  }
+
+  test.skipIf(!hasDom)('a slow initial restore read cannot offer the previous target after a switch', async () => {
+    let finishLoad!: (value: { data: unknown; generation: null }) => void;
+    const oldTransport = {
+      load: () => new Promise<{ data: unknown; generation: null }>(resolve => { finishLoad = resolve; }),
+      save: async () => {}, remove: async () => {},
+    };
+    const saved: object[] = [];
+    const nextTransport = {
+      load: async () => ({ data: null, generation: null }),
+      save: async (body: object) => { saved.push(body); }, remove: async () => {},
+    };
+    const s = await mountSession(options({ transport: oldTransport }));
+    try {
+      await act(async () => { s.result.current!.adoptDraftTarget({ found: false, draftGeneration: 7 }, nextTransport); });
+      await s.rerender(options({ transport: nextTransport }));
+      await act(async () => { finishLoad({ data: { codeAnnotations: [ANNOTATION], ts: Date.now() }, generation: null }); });
+      expect(s.result.current!.draftBanner).toBeNull();
+      await s.rerender(options({ transport: nextTransport, annotations: [{ ...ANNOTATION, id: 'new-target' }] }));
+      await tick(DEBOUNCE_WAIT_MS);
+      expect(saved.at(-1)).toMatchObject({ codeAnnotations: [{ ...ANNOTATION, id: 'new-target' }], draftGeneration: 8 });
+    } finally { await s.unmount(); }
+  });
+
+  test.skipIf(!hasDom)('switching before the debounce saves to the old target, reads the new target, then resumes there', async () => {
+    const savedA: object[] = [];
+    const savedB: object[] = [];
+    const merged: CodeAnnotation[] = [];
+    const transportA = {
+      load: async () => ({ data: null, generation: null }),
+      save: async (body: object) => { savedA.push(body); },
+      remove: async () => {},
+    };
+    const onB = { ...ANNOTATION, id: 'on-b' };
+    let finishLoad!: (value: { data: unknown; generation: null }) => void;
+    const transportB = {
+      load: () => new Promise<{ data: unknown; generation: null }>(resolve => { finishLoad = resolve; }),
+      save: async (body: object) => { savedB.push(body); },
+      remove: async () => {},
+    };
+    const s = await mountSession(options({ transport: transportA }));
+    try {
+      await s.rerender(options({ transport: transportA, annotations: [ANNOTATION] }));
+      // Switch immediately; waiting for debounce here would hide lost edits.
+      await act(async () => { await s.result.current!.flushBeforeSwitch(); });
+      expect(savedA).toHaveLength(1);
+      expect(savedA[0]).toMatchObject({ codeAnnotations: [ANNOTATION] });
+      await tick(DEBOUNCE_WAIT_MS);
+      expect(savedA).toHaveLength(1);
+      await act(async () => {
+        s.result.current!.adoptDraftTarget({ found: true, draftGeneration: 40 }, transportB);
+      });
+      await s.rerender(options({
+        transport: transportB, annotations: [ANNOTATION],
+        onDraftTargetMerge: items => { merged.push(...items.annotations); },
+      }));
+      await tick(DEBOUNCE_WAIT_MS);
+      expect(savedB).toEqual([]); // never overwrite B before reading it
+      await act(async () => { finishLoad({ data: { codeAnnotations: [onB], draftGeneration: 40 }, generation: null }); });
+      expect(merged).toEqual([onB]);
+      await s.rerender(options({ transport: transportB, annotations: [ANNOTATION, ...merged] }));
+      await tick(DEBOUNCE_WAIT_MS);
+      expect(savedB.at(-1)).toMatchObject({ codeAnnotations: [ANNOTATION, onB], draftGeneration: 41 });
+      expect(savedA).toHaveLength(1);
+    } finally { await s.unmount(); }
+  });
+
+  test.skipIf(!hasDom)('a viewed-only draft is offered if independent progress becomes unavailable after loading', async () => {
+    saveDraft(DRAFT_KEY, { viewedFiles: ['a.ts'], autoViewSuppressed: ['b.ts'], ts: Date.now() });
+    const s = await mountSession(options({ persistViewedFiles: false }));
+    expect(s.result.current!.draftBanner).toBeNull();
+    await s.rerender(options({ persistViewedFiles: true }));
+    expect(s.result.current!.draftBanner?.viewedCount).toBe(1);
+    let restored: ReturnType<HookResult['restoreDraft']>;
+    await act(async () => { restored = s.result.current!.restoreDraft(); });
+    expect(restored!.viewedFiles).toEqual(['a.ts']);
+    expect(restored!.autoViewSuppressed).toEqual(['b.ts']);
+    await s.unmount();
+  });
+
+  test.skipIf(!hasDom)('independent progress never restores legacy viewed marks or puts them in annotation drafts', async () => {
+    saveDraft(DRAFT_KEY, { codeAnnotations: [ANNOTATION], viewedFiles: ['stale.ts'], autoViewSuppressed: ['stale.ts'], ts: Date.now() });
+    const s = await mountSession(options({ persistViewedFiles: false }));
+    expect(s.result.current!.draftBanner?.viewedCount).toBe(0);
+    let restored: ReturnType<HookResult['restoreDraft']>;
+    await act(async () => { restored = s.result.current!.restoreDraft(); });
+    expect(restored!.annotations).toHaveLength(1);
+    expect(restored!.viewedFiles).toEqual([]);
+    expect(restored!.autoViewSuppressed).toEqual([]);
+    await s.rerender(options({ persistViewedFiles: false, annotations: [ANNOTATION], viewedFiles: new Set(['fresh.ts']) }));
+    await tick(DEBOUNCE_WAIT_MS);
+    expect(loadDraft(DRAFT_KEY)).toMatchObject({ codeAnnotations: [ANNOTATION] });
+    expect((loadDraft(DRAFT_KEY) as { viewedFiles?: string[] }).viewedFiles).toBeUndefined();
+    await s.unmount();
+  });
+
   test.skipIf(!hasDom)('deleting every annotation removes the draft so it does not resurrect (#948)', async () => {
     // Session 1: mount empty (lets the on-mount GET settle so hasMountedRef is
     // set), then the user adds an annotation -> it autosaves to disk.
@@ -455,6 +621,46 @@ describe('in-place switch onto another draft target (#1590)', () => {
 
     afterEach(() => { resetDraftTransport(); });
 
+    test.skipIf(!hasDom)('a failed switch keeps the current target protected until its pending draft load merges', async () => {
+      const t = deferredTransport();
+      const h = await mountHost([ann('mine')]);
+      try {
+        t.loads.shift()!({ data: null, generation: null });
+        await tick(0);
+        await h.adopt({ found: true, draftGeneration: 5 });
+        await h.setViewed(new Set(['b.ts']));
+        await act(async () => {
+          await h.result.current!.flushBeforeSwitch();
+          h.result.current!.adoptDraftTarget(undefined); // attempted switch failed
+        });
+        await tick(DEBOUNCE_WAIT_MS);
+        expect(t.saves).toEqual([]); // must not overwrite the unread draft
+        await act(async () => {
+          t.loads.shift()!({ data: { codeAnnotations: [ann('waiting-on-b')], draftGeneration: 5 }, generation: null });
+        });
+        await tick(DEBOUNCE_WAIT_MS);
+        expect(h.ids()).toEqual(['mine', 'waiting-on-b']);
+        expect(t.saves.at(-1)?.codeAnnotations?.map(a => a.id)).toEqual(['mine', 'waiting-on-b']);
+      } finally { await h.unmount(); }
+    });
+
+    test.skipIf(!hasDom)('a failed switch cannot release an unreadable target to autosave', async () => {
+      const t = scriptedTransport(['fail', 'fail', 'fail', 'fail', bDraft]);
+      const h = await mountHost([ann('mine')]);
+      try {
+        await h.adopt({ found: true, draftGeneration: 5 });
+        await h.setViewed(new Set(['b.ts']));
+        await tick(DEBOUNCE_WAIT_MS);
+        await act(async () => { h.result.current!.adoptDraftTarget(undefined); });
+        await h.setAnnotations([ann('mine'), ann('later')]);
+        await tick(DEBOUNCE_WAIT_MS); // retries the protected read, then merges
+        await tick(DEBOUNCE_WAIT_MS);
+        expect(h.ids()).toEqual(['mine', 'later', 'waiting-on-b']);
+        expect(t.saves.every(body => body.codeAnnotations?.some(a => a.id === 'waiting-on-b'))).toBe(true);
+        expect(t.saves.length).toBeGreaterThan(0);
+      } finally { await h.unmount(); }
+    });
+
     test.skipIf(!hasDom)('A→B(draft, slow)→C(no draft): nothing stale is merged, and C keeps saving', async () => {
       const t = deferredTransport();
       const h = await mountHost([ann('mine')]);
@@ -565,5 +771,66 @@ describe('in-place switch onto another draft target (#1590)', () => {
       expect(t.saves.at(-1)?.codeAnnotations?.map((a) => a.id)).toEqual(['mine']);
       await h.unmount();
     });
+  });
+});
+
+// A render error's notice takes the review's place (ui's RegionBoundary), and its Reload reloads the page: neither may
+// drop the comment saved half a second after it was made. What regresses: a comment added just before the failure is
+// gone after Reload.
+describe('a render error, and its Reload, keep the comment waiting to be saved', () => {
+  function recordingTransport(order: string[] = []) {
+    const saves: { codeAnnotations?: CodeAnnotation[] }[] = [];
+    return {
+      saves,
+      order,
+      transport: {
+        load: async () => ({ data: null, generation: null }),
+        save: async (body: object) => {
+          saves.push(body as { codeAnnotations?: CodeAnnotation[] });
+          order.push('save');
+        },
+        remove: async () => {},
+      },
+    };
+  }
+
+  test.skipIf(!hasDom)('the host unmounting with a save still waiting sends it', async () => {
+    const t = recordingTransport();
+    const s = await mountSession(options({ transport: t.transport }));
+    await s.rerender(options({ transport: t.transport, annotations: [ANNOTATION] }));
+    expect(t.saves).toEqual([]);
+    await s.unmount();
+    await tick(20);
+    expect(t.saves.map((d) => d.codeAnnotations?.map((a) => a.id))).toEqual([['a1']]);
+  });
+
+  test.skipIf(!hasDom)('a change of the comments sends no extra save: only the last state, after the pause', async () => {
+    const t = recordingTransport();
+    const s = await mountSession(options({ transport: t.transport }));
+    try {
+      await s.rerender(options({ transport: t.transport, annotations: [ANNOTATION] }));
+      await s.rerender(options({ transport: t.transport, annotations: [ANNOTATION, { ...ANNOTATION, id: 'a2' }] }));
+      await tick(20);
+      expect(t.saves).toEqual([]);
+      await tick(DEBOUNCE_WAIT_MS);
+      expect(t.saves.map((d) => d.codeAnnotations?.map((a) => a.id))).toEqual([['a1', 'a2']]);
+    } finally { await s.unmount(); }
+  });
+
+  test.skipIf(!hasDom)("a failure box's Reload sends the waiting save before the page reloads", async () => {
+    const { reloadAfterFlush } = await import('./utils/beforeReload');
+    const t = recordingTransport();
+    const s = await mountSession(options({ transport: t.transport }));
+    try {
+      await s.rerender(options({ transport: t.transport, annotations: [ANNOTATION] }));
+      await act(async () => {
+        await reloadAfterFlush(() => t.order.push('reload'));
+      });
+      expect(t.order).toEqual(['save', 'reload']);
+      expect(t.saves[0]?.codeAnnotations?.map((a) => a.id)).toEqual(['a1']);
+      // Sent once: the pause's own save does not follow.
+      await tick(DEBOUNCE_WAIT_MS);
+      expect(t.saves).toHaveLength(1);
+    } finally { await s.unmount(); }
   });
 });

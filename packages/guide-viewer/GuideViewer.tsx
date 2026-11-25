@@ -2,7 +2,7 @@ import React, { useCallback, useMemo, useState } from 'react';
 import type { GuideSnapshot } from '@plannotator/core/guide-format';
 import { GUIDE_ENGINE_LABEL, type CodeGuideData } from '@plannotator/core/guide';
 import { parseDiffToFiles } from './diffParser';
-import { GuideHostProvider, type GuideDiffRendererContext, type GuideDiffRendererProps } from './host';
+import { GuideHostProvider, type GuideDiffRendererContext, type GuideDiffRendererProps, type GuideHostValue } from './host';
 import { GuideView } from './GuideView';
 import type { DiffFile } from './types';
 
@@ -25,6 +25,10 @@ export interface GuideViewerProps<P extends object> {
   sourceLine?: React.ReactNode;
   /** Host-provided controls rendered top-right of the guide header (e.g. a theme toggle). */
   headerActions?: React.ReactNode;
+  /** Draws the overview's diagram (format version 2); see `GuideHostValue.renderOverviewDiagram`. */
+  renderOverviewDiagram?: GuideHostValue['renderOverviewDiagram'];
+  /** Draws a chapter's diagram (format version 5); see `GuideHostValue.renderChapterDiagram`. */
+  renderChapterDiagram?: GuideHostValue['renderChapterDiagram'];
   className?: string;
 }
 
@@ -49,18 +53,19 @@ const AUTHORED_ENGINE_LABEL: Record<string, string> = {
  * producer knew it (self-reported by the agent from its harness, or the model
  * a Plannotator job was launched with).
  */
-function engineLabel(engine: string | undefined, model: string | undefined): string | undefined {
+export function engineLabel(engine: string | undefined, model: string | undefined): string | undefined {
   if (!engine) return model || undefined;
   const label = (GUIDE_ENGINE_LABEL as Record<string, string>)[engine] ?? AUTHORED_ENGINE_LABEL[engine] ?? engine;
   return model ? `${label} · ${model}` : label;
 }
 
-export function GuideViewer<P extends object>({ snapshot, DiffRenderer, getDiffRendererProps, sourceLine, headerActions, className }: GuideViewerProps<P>) {
+export function GuideViewer<P extends object>({ snapshot, DiffRenderer, getDiffRendererProps, sourceLine, headerActions, renderOverviewDiagram, renderChapterDiagram, className }: GuideViewerProps<P>) {
   const files = useMemo<DiffFile[]>(() => parseDiffToFiles(snapshot.review.rawPatch), [snapshot.review.rawPatch]);
   const guide = useMemo<CodeGuideData>(
     () => ({
       title: snapshot.guide.title,
       intent: snapshot.guide.intent,
+      ...(snapshot.guide.overview && { overview: snapshot.guide.overview }),
       sections: snapshot.guide.sections,
       unplacedFiles: snapshot.guide.unplacedFiles,
       reviewed: [...snapshot.guide.reviewed],
@@ -74,8 +79,8 @@ export function GuideViewer<P extends object>({ snapshot, DiffRenderer, getDiffR
   }, []);
 
   const host = useMemo(
-    () => ({ files, DiffRenderer, getDiffRendererProps }),
-    [files, DiffRenderer, getDiffRendererProps],
+    () => ({ files, DiffRenderer, getDiffRendererProps, renderOverviewDiagram, renderChapterDiagram }),
+    [files, DiffRenderer, getDiffRendererProps, renderOverviewDiagram, renderChapterDiagram],
   );
 
   return (

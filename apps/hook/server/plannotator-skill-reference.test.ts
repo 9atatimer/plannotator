@@ -9,6 +9,10 @@
  *   - Subcommands: BIDIRECTIONAL. Every subcommand the skill documents must
  *     exist in the CLI, and every user-facing CLI subcommand must appear in
  *     the skill. A renamed, removed, or newly added subcommand fails here.
+ *     Unreleased subcommands (HIDDEN_SUBCOMMANDS in cli.ts, empty today)
+ *     are the one exception, and the rule flips for them: they must NOT be
+ *     in the skill or the top-level help until they are taken out of that
+ *     set.
  *   - Flags: ONE-DIRECTIONAL. Every flag the skill mentions must be accepted
  *     somewhere in the CLI, so a renamed or deleted flag fails. The reverse
  *     is NOT asserted: a new CLI flag that the skill never mentions passes.
@@ -28,8 +32,11 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AGENT_CONFIG } from "@plannotator/shared/agents";
+import { INBOX_CARD_INITIATIVE_RULE } from "@plannotator/core/inbox-types";
+import { QUESTION_AUTHORING_GUIDE } from "@plannotator/shared/question-block";
 import {
   formatTopLevelHelp,
+  HIDDEN_SUBCOMMANDS,
   SUBCOMMAND_HELP,
   SUBCOMMAND_HELP_ALIASES,
 } from "./cli";
@@ -124,12 +131,23 @@ for (const m of indexSource.matchAll(/args\[0\] === "([a-z][a-z0-9-]*)"/g)) {
 const skillDoc = readFileSync(SKILL_MD_PATH, "utf-8");
 const annotateSkillDoc = readFileSync(ANNOTATE_SKILL_MD_PATH, "utf-8");
 
-const documentedSubcommands = new Set<string>();
-for (const fence of skillDoc.matchAll(/```[a-z]*\n([\s\S]*?)```/g)) {
-  for (const m of fence[1].matchAll(/^\s*plannotator\s+([a-z][a-z0-9-]*)/gm)) {
-    documentedSubcommands.add(m[1]);
+// A fenced usage line documents a subcommand, and so does an inline pointer to
+// its own help (`plannotator <command> --help`), for a section that hands the whole
+// guide to that help.
+function documentedSubcommandsOf(doc: string): Set<string> {
+  const subs = new Set<string>();
+  for (const fence of doc.matchAll(/```[a-z]*\n([\s\S]*?)```/g)) {
+    for (const m of fence[1].matchAll(/^\s*plannotator\s+([a-z][a-z0-9-]*)/gm)) {
+      subs.add(m[1]);
+    }
   }
+  for (const m of doc.matchAll(/(?<!`)`plannotator ([a-z][a-z0-9-]*) --help`/g)) {
+    subs.add(m[1]);
+  }
+  return subs;
 }
+
+const documentedSubcommands = documentedSubcommandsOf(skillDoc);
 
 const documentedFlags = new Set<string>();
 for (const m of skillDoc.matchAll(/(?<![\w-])--[a-z][a-z0-9-]*/g)) {
@@ -210,7 +228,8 @@ describe("plannotator knowledge skill freshness", () => {
   test("no user-facing CLI subcommand is missing from the skill", () => {
     // The user-facing surface is what cli.ts publishes help for (plus its
     // aliases and the top-level usage lines). Internal dispatch-only
-    // subcommands (opencode-*, copilot-plan, install-runtime) are exempt.
+    // subcommands (opencode-*, copilot-plan, install-runtime) are exempt, and
+    // so are unreleased ones (HIDDEN_SUBCOMMANDS; see the next test).
     const userFacing = new Set<string>([
       ...Object.keys(SUBCOMMAND_HELP),
       ...Object.keys(SUBCOMMAND_HELP_ALIASES),
@@ -220,6 +239,8 @@ describe("plannotator knowledge skill freshness", () => {
     )) {
       userFacing.add(m[1]);
     }
+    for (const sub of HIDDEN_SUBCOMMANDS) userFacing.delete(sub);
+    expect(userFacing.size).toBeGreaterThanOrEqual(8);
     for (const sub of userFacing) {
       expect(
         documentedSubcommands.has(sub),
@@ -227,4 +248,116 @@ describe("plannotator knowledge skill freshness", () => {
       ).toBe(true);
     }
   });
+
+  // Every way a hidden subcommand can leak, for one name. Separate from the
+  // test so the check can be driven with a set other than HIDDEN_SUBCOMMANDS,
+  // which is empty while nothing is unreleased.
+  function hiddenSubcommandLeaks(sub: string): string[] {
+    const leaks: string[] = [];
+    if (!(sub in SUBCOMMAND_HELP)) {
+      leaks.push(`HIDDEN_SUBCOMMANDS names \`${sub}\`, which has no SUBCOMMAND_HELP entry — remove it from the set`);
+    }
+    if (documentedSubcommands.has(sub) || skillDoc.toLowerCase().includes(`plannotator ${sub}`)) {
+      leaks.push(`\`plannotator ${sub}\` is unreleased (HIDDEN_SUBCOMMANDS in cli.ts) but apps/skills/core/plannotator/SKILL.md documents it`);
+    }
+    if (formatTopLevelHelp().includes(`plannotator ${sub}`)) {
+      leaks.push(`\`plannotator ${sub}\` is unreleased (HIDDEN_SUBCOMMANDS in cli.ts) but \`plannotator --help\` lists it`);
+    }
+    return leaks;
+  }
+
+  test("unreleased subcommands stay out of the skill and the top-level help", () => {
+    // What regresses: someone documents a hidden subcommand and agents start
+    // running it, or it leaks into `plannotator --help`. A hidden entry must
+    // also still be a real subcommand, so a stale name in the set cannot make
+    // this pass vacuously.
+    for (const sub of HIDDEN_SUBCOMMANDS) {
+      expect(hiddenSubcommandLeaks(sub)).toEqual([]);
+    }
+    // The check itself must still bite: a released, documented subcommand
+    // reads as leaked in both places, and a name with no help entry as stale.
+    expect(hiddenSubcommandLeaks("review")).toHaveLength(2);
+    expect(hiddenSubcommandLeaks("no-such-subcommand")).toHaveLength(1);
+  });
+
+  test("the Inbox is released: in the top-level help and the skill", () => {
+    // It was the hidden subcommand until launch; nothing hides it now.
+    expect(HIDDEN_SUBCOMMANDS.has("inbox")).toBe(false);
+    expect(formatTopLevelHelp()).toContain("plannotator inbox mcp");
+    expect(documentedSubcommands.has("inbox")).toBe(true);
+  });
+});
+
+/**
+ * The "Asking the reviewer questions" section is a copy of
+ * QUESTION_AUTHORING_GUIDE (packages/core/question-block.ts), the one source
+ * hosts put in their own agent prompts. What regresses: the grammar, the
+ * `[x]` = settled rule, or the soft cap changes in core (or someone edits
+ * the skill by hand) and agents reading the skill write question blocks the
+ * renderer no longer parses the way the skill says. Exact, not fuzzy: the
+ * section must equal the guide byte for byte, so the fix is always "paste
+ * the guide again".
+ */
+describe("plannotator skill: question authoring section", () => {
+  const heading = QUESTION_AUTHORING_GUIDE.split("\n", 1)[0]!;
+
+  function skillSection(doc: string): string | null {
+    const start = doc.indexOf(`\n${heading}\n`);
+    if (start < 0) return null;
+    const lines = doc.slice(start + 1).split("\n");
+    // The next level-2 heading outside a code fence ends the section.
+    let inFence = false;
+    for (let i = 1; i < lines.length; i++) {
+      if (/^(```|~~~)/.test(lines[i]!)) inFence = !inFence;
+      if (!inFence && /^## /.test(lines[i]!)) return lines.slice(0, i).join("\n");
+    }
+    return lines.join("\n");
+  }
+
+  test("the section exists and equals QUESTION_AUTHORING_GUIDE", () => {
+    const section = skillSection(skillDoc);
+    expect(
+      section,
+      `apps/skills/core/plannotator/SKILL.md has no "${heading}" section — paste QUESTION_AUTHORING_GUIDE from packages/core/question-block.ts`,
+    ).not.toBeNull();
+    expect(section!.trim()).toBe(QUESTION_AUTHORING_GUIDE.trim());
+  });
+
+  test("the guide covers the rules agents need", () => {
+    // Facts, not prose: the three kinds, the settled and recommendation
+    // markers, the soft cap, and where answers come back.
+    for (const fact of [":::question", ":::question-multi", ":::question-text", "- [x]", "Recommended:", "about 8", "Answers to your questions", "Unanswered"]) {
+      expect(QUESTION_AUTHORING_GUIDE).toContain(fact);
+    }
+  });
+});
+
+// Shape is gone: the skill an agent reads never names `plannotator shape`, which is now an unknown command.
+test("the plannotator skill names no `plannotator shape`", () => {
+  expect(skillDoc.toLowerCase()).not.toContain("plannotator shape");
+  expect(documentedSubcommandsOf(skillDoc).has("shape")).toBe(false);
+});
+
+// Thread steps (approval "inbox-thread-steps") are off by default, and an optional feature's instructions reach an
+// agent only while it is on: the tool text and `plannotator inbox --help` teach steps then. A skill is shipped text
+// every agent reads whatever the person chose, so no shipped skill may name the feature. (The bare word stays fine
+// elsewhere: "follow its two steps" for T3, a plan's "Ordered steps".)
+test("no shipped skill teaches thread steps, which are off by default", () => {
+  const root = join(import.meta.dir, "../../skills");
+  const skills = [...new Bun.Glob("**/SKILL.md").scanSync({ cwd: root })];
+  expect(skills).toContain(join("core", "plannotator", "SKILL.md"));
+  const feature = /`steps`|inbox steps|thread steps|steps action|steps_off|steps field|\bsteps\s*:\s*\[/i;
+  for (const skill of skills) {
+    const text = readFileSync(join(root, skill), "utf-8");
+    expect({ skill, mentions: text.match(feature)?.[0] ?? null }).toEqual({ skill, mentions: null });
+  }
+});
+
+// The initiative rule lives once (INBOX_CARD_INITIATIVE_RULE); the skill is markdown, so it pastes the rule. An edit
+// to the constant that misses the skill (or the reverse) would teach agents two different rules.
+test("the skill's card section carries the initiative rule word for word", () => {
+  expect(skillDoc).toContain(INBOX_CARD_INITIATIVE_RULE);
+  expect(skillDoc).toContain("--initiative <name>");
+  // Clearing out is in `plannotator card --help` and the nudge only (the owner: "Try not to bloat main instruction").
+  expect(skillDoc).not.toMatch(/work is done, delete|\bdelete it \(/);
 });

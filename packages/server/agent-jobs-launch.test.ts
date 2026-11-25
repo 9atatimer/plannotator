@@ -150,6 +150,27 @@ describe("POST /api/agents/jobs — reviewProfileId launch plumbing", () => {
   });
 });
 
+describe("POST /api/agents/jobs — the run keeps what was launched", () => {
+  test("a caller's own label comes back as launchLabel beside the server's label; the server's default adds nothing", async () => {
+    const handler = createAgentJobHandler({
+      mode: "review",
+      getServerUrl: () => "http://localhost:1234",
+      getCwd: () => "/tmp",
+      async buildCommand() {
+        return { command: ["true"], label: "Code Review", model: "opus", reviewProfileLabel: "Security" };
+      },
+    });
+    const own = await (await handler.handle(post({ provider: "claude", label: "Review: money rounding" }), JOBS_URL))!.json();
+    expect(own.job.label).toBe("Code Review");
+    expect(own.job.launchLabel).toBe("Review: money rounding");
+    expect(own.job.model).toBe("opus");
+    expect(own.job.reviewProfileLabel).toBe("Security");
+    const plain = await (await handler.handle(post({ provider: "claude", label: "Code Review" }), JOBS_URL))!.json();
+    expect(plain.job.launchLabel).toBeUndefined();
+    handler.killAll();
+  });
+});
+
 describe("POST /api/agents/jobs — guide launch review plumbing (portable export)", () => {
   test("launchReview is handed to onJobComplete but never appears on the broadcast job", async () => {
     const launchReview = { rawPatch: "diff --git a/x b/x\n", gitRef: "HEAD", source: { kind: "local" as const } };
@@ -249,5 +270,52 @@ describe("POST /api/agents/jobs — OpenCode runs in the review's cwd (#1609)", 
       else process.env.PWD = realPwd;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Claude blocked-shell warning (#1627)", () => {
+  const line = (o: unknown) => JSON.stringify(o);
+  const denied = "Permission to use Bash has been denied because Claude Code is running in don't ask mode.";
+  const streamFor = (secondOk: boolean) => [
+    line({ type: "assistant", message: { content: [{ type: "tool_use", id: "a", name: "Bash", input: { command: "git merge-base main HEAD" } }] } }),
+    line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "a", content: denied, is_error: true }] } }),
+    line({ type: "assistant", message: { content: [{ type: "tool_use", id: "b", name: "Bash", input: { command: "git diff" } }] } }),
+    line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "b", content: secondOk ? "diff --git a/x b/x" : denied, is_error: !secondOk }] } }),
+    line({ type: "result", is_error: false, permission_denials: secondOk ? [{ tool_name: "Bash", tool_use_id: "a" }] : [{ tool_name: "Bash", tool_use_id: "a" }, { tool_name: "Bash", tool_use_id: "b" }] }),
+  ].join("\n");
+
+  async function runClaudeJob(stream: string, provider = "claude") {
+    let seen: { warning?: string } | undefined;
+    let done: (() => void) | undefined;
+    const completed = new Promise<void>((resolve) => { done = resolve; });
+    const handler = createAgentJobHandler({
+      mode: "review",
+      getServerUrl: () => "http://localhost:1234",
+      getCwd: () => tmpdir(),
+      async buildCommand() {
+        // Trailing flags are ignored by `bun -e`; the runner reads the allowlist from them.
+        return { command: [process.execPath, "-e", `process.stdout.write(${JSON.stringify(stream)})`, "--allowedTools", "Bash(git merge-base:*),Bash(git diff:*)"], captureStdout: true };
+      },
+      async onJobComplete(job) {
+        seen = { warning: job.warning };
+        done?.();
+      },
+    });
+    const res = await handler.handle(post({ provider }), JOBS_URL);
+    expect(res?.status).toBe(201);
+    await completed;
+    handler.killAll();
+    return seen;
+  }
+
+  test("a Claude job whose every shell command was refused carries the opt-out warning", async () => {
+    const seen = await runClaudeJob(streamFor(false));
+    expect(seen?.warning).toContain("PLANNOTATOR_CLAUDE_SANDBOX=0");
+    expect(seen?.warning).toContain("claudeSandbox");
+  });
+
+  test("no warning once a shell command ran", async () => {
+    const seen = await runClaudeJob(streamFor(true));
+    expect(seen?.warning).toBeUndefined();
   });
 });

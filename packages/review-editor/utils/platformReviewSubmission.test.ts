@@ -9,6 +9,11 @@ import {
   submitPlatformReviewTargets,
 } from './platformReviewSubmission';
 import {
+  __resetServerSessionForTests,
+  adoptServerSession,
+  isServerSessionReplaced,
+} from '@plannotator/ui/utils/serverSession';
+import {
   buildReviewSubmissionRecovery,
   loadReviewSubmissionRecovery,
   restoreReviewSubmission,
@@ -313,5 +318,60 @@ describe('request_changes across a multi-PR submission', () => {
     // The succeeded target is never re-posted; the failed one retries as request_changes.
     expect(actions).toEqual([[second.prUrl, 'request_changes']]);
     expect(retried.allComplete).toBe(true);
+  });
+});
+
+// A GitLab before 18.9 has no request changes: the review stays a comment, and the words follow what went.
+describe('a request for changes that went as a comment', () => {
+  const submit = (targets: SubmissionTarget[], responses: object[]) => submitPlatformReviewTargets({
+    targets,
+    action: 'request_changes',
+    generalComment: 'Please fix',
+    bodyForTarget: () => 'Please fix',
+    fetchReview: async () => successResponse(responses.shift()!),
+  });
+
+  test('says so on the attempt', async () => {
+    const went = await submit([baseTarget], [{ status: 'complete', postedAs: 'comment' }]);
+    expect(went.allComplete).toBe(true);
+    expect(went.postedAs).toBe('comment');
+
+    const requested = await submit([baseTarget], [{ status: 'complete' }]);
+    expect(requested.postedAs).toBeUndefined();
+  });
+
+  test('a retry that completes a partial post keeps it', async () => {
+    const first = await submit([baseTarget], [{ ...partial([comments[2]], 2), postedAs: 'comment' }]);
+    expect(first.targets[0].status).toBe('partial');
+    const retried = await submit(first.targets, [{ status: 'complete' }]);
+    expect(retried.allComplete).toBe(true);
+    expect(retried.postedAs).toBe('comment');
+  });
+});
+
+// The stale-tab guard on /api/pr-action: the tab echoes its nonce, and a
+// server that took over the port refuses it; the tab then shows the reload
+// prompt instead of an ordinary failure, and nothing was posted.
+describe('platform review on a replaced server', () => {
+  test('sends the nonce, and a session_mismatch refusal marks the tab replaced', async () => {
+    __resetServerSessionForTests();
+    adoptServerSession('a'.repeat(32));
+    let sent: Record<string, unknown> = {};
+    try {
+      const result = await submitPlatformReviewTarget({
+        target: baseTarget,
+        action: 'comment',
+        body: 'x',
+        fetchReview: async (_input, init) => {
+          sent = JSON.parse(init.body as string) as Record<string, unknown>;
+          return Response.json({ error: 'replaced', code: 'session_mismatch' }, { status: 409 });
+        },
+      });
+      expect(sent.serverSession).toBe('a'.repeat(32));
+      expect(result.target.status).not.toBe('success');
+      expect(isServerSessionReplaced()).toBe(true);
+    } finally {
+      __resetServerSessionForTests();
+    }
   });
 });

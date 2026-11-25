@@ -11,7 +11,9 @@ import {
   type JjEvoLogEntry,
   type JjLineBaseResolution,
   type JjRevisionInfo,
+  type RepoFileListing,
   JJ_TRUNK_REVSET,
+  compareRepoPaths,
   jjCommitRevset,
   jjLineBaseRevset,
   parseJjCommitDiffType,
@@ -28,6 +30,14 @@ export {
   type JjLineBaseResolution,
   type JjRevisionInfo,
 } from "./review-core";
+
+/**
+ * Global options every runtime prepends to a `jj` command, so output Plannotator
+ * parses never carries ANSI color or goes to a pager, whatever the user's
+ * `ui.color` / `ui.paginate` say (#1661). `ui.color = "always"` colors
+ * `jj diff --git` even through a pipe; `--color=never` overrides it.
+ */
+export const JJ_COLOR_FREE_ARGS: readonly string[] = Object.freeze(["--color=never", "--no-pager"]);
 
 export interface ReviewJjRuntime {
   runJj: (
@@ -109,7 +119,7 @@ export async function getJjContext(
       { id: "jj-last", label: "Last change" },
       { id: "jj-line", label: "Line of work" },
       ...(evologs.length >= 2 ? [{ id: "jj-evolog", label: "Evolution diff" }] : []),
-      { id: "jj-all", label: "All files" },
+      { id: "jj-all", label: "Every file" },
     ],
     worktrees: [],
     availableBranches: targets,
@@ -513,6 +523,41 @@ async function resolveJjSideRevs(
   }
 }
 
+/**
+ * The repository at a jj review's new side (All files). `jj file list` reads
+ * the revision's tree, so it is never "live": the working copy is snapshotted
+ * by the next jj command, and the review's Refresh picks that up.
+ */
+export async function listJjFilesForDiff(
+  runtime: ReviewJjRuntime,
+  diffType: DiffType,
+  defaultBranch: string,
+  cwd?: string,
+): Promise<RepoFileListing | null> {
+  const revs = await resolveJjSideRevs(runtime, diffType, defaultBranch, "", undefined, cwd);
+  if (!revs?.new) return null;
+  const rev = revs.new.rev;
+  const options = { cwd: revs.cwd, timeoutMs: 5 * 60_000 };
+  // NUL-separated through a template where the jj supports it; one path a line otherwise.
+  let listed = await runtime.runJj(["file", "list", "-r", rev, "-T", 'path ++ "\\0"'], options);
+  let paths: string[];
+  if (listed.exitCode === 0) {
+    paths = listed.stdout.split("\0").filter(Boolean);
+  } else {
+    listed = await runtime.runJj(["file", "list", "-r", rev], options);
+    if (listed.exitCode !== 0) return null;
+    paths = listed.stdout.split("\n").filter(Boolean);
+  }
+  paths.sort(compareRepoPaths);
+  const label = await runtime.runJj(["log", "-r", rev, "--no-graph", "-T", "change_id.short()"], options);
+  return {
+    paths,
+    revision: { kind: "commit", label: label.exitCode === 0 && label.stdout.trim() ? label.stdout.trim() : rev },
+    live: false,
+    root: revs.cwd,
+  };
+}
+
 export async function getJjFileContentsForDiff(
   runtime: ReviewJjRuntime,
   diffType: DiffType,
@@ -527,6 +572,23 @@ export async function getJjFileContentsForDiff(
     oldContent: revs.old ? await jjFileContent(runtime, revs.old.rev, revs.old.path, revs.cwd) : null,
     newContent: revs.new ? await jjFileContent(runtime, revs.new.rev, revs.new.path, revs.cwd) : null,
   };
+}
+
+/**
+ * A jj fileset naming exactly one repository-relative path. A bare path after
+ * `--` is a fileset EXPRESSION, so a file named `a|b.png` would show `a` and
+ * `b.png` (and `~`, `&`, `(`, globs and pattern prefixes likewise): a path
+ * that came out of a diff, or out of a Markdown file the review shows, must
+ * never be read as one. `root-file:"…"` is the literal path from the
+ * workspace root, with `\` and `"` escaped and control characters written as
+ * `\xHH` (jj's string-literal escapes).
+ */
+export function jjRootFileFileset(path: string): string {
+  const escaped = path.replace(/[\\"\u0000-\u001f\u007f]/g, (ch) => {
+    if (ch === "\\" || ch === '"') return `\\${ch}`;
+    return `\\x${ch.charCodeAt(0).toString(16).padStart(2, "0")}`;
+  });
+  return `root-file:"${escaped}"`;
 }
 
 /** One side of a jj diff as raw bytes for the image preview, capped at `maxBytes`. */
@@ -548,7 +610,7 @@ export async function getJjFileBytesForDiff(
   // jj has no cheap size probe, so the byte cap is the gate: one byte over
   // the limit truncates the read and reports it as too large.
   const result = await runtime.runJjBytes(
-    ["file", "show", "-r", source.rev, "--", source.path],
+    ["file", "show", "-r", source.rev, "--", jjRootFileFileset(source.path)],
     { cwd: revs.cwd, maxOutputBytes: maxBytes },
   );
   if (result.truncated) return { kind: "too-large", size: maxBytes + 1 };
@@ -584,7 +646,7 @@ export function getJjDiffArgs(
         label: `Evolution diff from ${compareTarget.slice(0, 8)}`,
       };
     case "jj-all":
-      return { args: ["diff", "--git", ...whitespaceArgs, "--from", "root()", "--to", "@"], label: "All files" };
+      return { args: ["diff", "--git", ...whitespaceArgs, "--from", "root()", "--to", "@"], label: "Every file" };
     default:
       return null;
   }
@@ -844,7 +906,7 @@ async function jjFileContent(
   filePath: string,
   cwd?: string,
 ): Promise<string | null> {
-  const result = await runtime.runJj(["file", "show", "-r", rev, "--", filePath], { cwd });
+  const result = await runtime.runJj(["file", "show", "-r", rev, "--", jjRootFileFileset(filePath)], { cwd });
   return result.exitCode === 0 ? result.stdout : null;
 }
 

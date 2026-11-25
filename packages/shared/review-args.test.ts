@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { REVIEW_OPEN_DIFF_TYPES, parseReviewArgs } from "./review-args";
+import { REVIEW_OPEN_DIFF_TYPES, formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory } from "./review-args";
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { join } from "node:path";
 import { GIT_DIFF_TYPES } from "./vcs-core";
 
 describe("parseReviewArgs", () => {
@@ -54,6 +57,14 @@ describe("parseReviewArgs", () => {
     });
   });
 
+  // #1907: `plannotator review --gate` (an agent waiting for the sign-off) must
+  // not be refused as an unknown option on hosts that run the CLI as written.
+  test("--gate is accepted, marked, and absent otherwise", () => {
+    expect(parseReviewArgs("--gate")).toMatchObject({ gate: true, errors: [] });
+    expect(parseReviewArgs(["--gate", "../wt"])).toMatchObject({ gate: true, words: ["../wt"], errors: [] });
+    expect("gate" in parseReviewArgs("")).toBe(false);
+  });
+
   test("--no-git-remote-check sets the opt-out bit and is absent otherwise", () => {
     // #1553: every host (CLI, OpenCode, Pi) forwards this bit to the review
     // server. It must be absent — not `true` — when the flag is not typed, or
@@ -96,12 +107,12 @@ describe("parseReviewArgs", () => {
       .toBe("https://github.com/acme/repo/pull/12");
   });
 
-  test("keeps non-url positional input as local review mode", () => {
-    // Positional word tolerance is load-bearing: slash-command hosts forward
-    // raw user prose to `plannotator review` verbatim. Over-tightening this
-    // would break every /plannotator-review invocation that carries words.
+  test("keeps non-URL positional words for the host's directory resolution", () => {
+    // Slash-command hosts forward raw user prose verbatim, so the parser never
+    // rejects words; resolveReviewTarget decides what they name.
     expect(parseReviewArgs("--git not-a-url")).toEqual({
       prUrl: undefined,
+      words: ["not-a-url"],
       vcsType: "git",
       useLocal: true,
       errors: [],
@@ -114,7 +125,7 @@ describe("parseReviewArgs", () => {
     // on every host. A typo'd flag must fail loudly, exactly as on annotate.
     const parsed = parseReviewArgs("--bse main");
     expect(parsed.errors).toEqual(["Unknown review option: --bse"]);
-    // The stray value token stays a tolerated positional word.
+    // The stray value is a directory candidate, but the option error prevents launch.
     expect(parsed.prUrl).toBeUndefined();
   });
 
@@ -247,5 +258,156 @@ describe("parseReviewArgs", () => {
     // when / then
     expect(parseReviewArgs(missingPath).errors).toEqual(["--patch-file requires a path or -"]);
     expect(parseReviewArgs(duplicatePath).errors).toEqual(["--patch-file may only be specified once"]);
+  });
+});
+
+describe("review directory targets", () => {
+  test("keeps quoted paths intact and consumes flag values separately", () => {
+    for (const input of [
+      '--base main "../feature worktree" --diff-type last-commit',
+      ["--base", "main", "../feature worktree", "--diff-type", "last-commit"],
+    ]) {
+      expect(parseReviewArgs(input)).toMatchObject({
+        words: ["../feature worktree"], base: "main", diffType: "last-commit", errors: [],
+      });
+    }
+  });
+
+  test("finds a PR/MR URL anywhere among the words and refuses two", () => {
+    expect(parseReviewArgs("please review https://github.com/a/b/pull/1")).toMatchObject({
+      prUrl: "https://github.com/a/b/pull/1", words: ["please", "review"], errors: [],
+    });
+    expect(parseReviewArgs("https://github.com/a/b/pull/1 https://github.com/a/b/pull/2").errors).toHaveLength(1);
+  });
+
+  function withTree(run: (root: string) => void) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "review-directory-")));
+    const originalCwd = process.cwd();
+    try {
+      mkdirSync(join(root, "repo with spaces"));
+      mkdirSync(join(root, "backend"));
+      mkdirSync(join(root, "myproject"));
+      mkdirSync(join(root, "src", "components"), { recursive: true });
+      writeFileSync(join(root, "file"), "not a directory");
+      symlinkSync(join(root, "repo with spaces"), join(root, "link"), "dir");
+      run(root);
+      expect(process.cwd()).toBe(originalCwd);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const target = (input: string, cwd: string) => resolveReviewTarget(parseReviewArgs(input), cwd);
+
+  test("resolves against the caller, accepts symlinked directories, and refuses files", () => {
+    withTree((root) => {
+      expect(target('"repo with spaces"', root).directory).toBe(join(root, "repo with spaces"));
+      expect(target(`"${join(root, "repo with spaces")}"`, "/elsewhere").directory).toBe(join(root, "repo with spaces"));
+      expect(target("link", root).directory).toBe(join(root, "link"));
+      expect(target("backend", root).directory).toBe(join(root, "backend"));
+      expect(target("~", root).directory).toBe(homedir());
+      expect(target("", root)).toEqual({ ignored: [] });
+      expect(() => target("file", root)).toThrow(
+        `${join(root, "file")} is a file, not a folder; nothing was opened.\n` +
+          "To comment on the file, run: plannotator annotate file\n" +
+          "To review the current project instead, run: plannotator review",
+      );
+    });
+  });
+
+  test("a sole path-shaped typo fails loudly instead of reviewing the caller's repo", () => {
+    withTree((root) => {
+      for (const input of ["./missing", "../missing", "missing/sub"]) {
+        expect(() => target(input, root)).toThrow(`No folder "${input}" in ${root}; nothing was opened.`);
+      }
+      const home = join(homedir(), "plannotator-missing-dir-xyz");
+      expect(() => target("~/plannotator-missing-dir-xyz", root)).toThrow(`No folder at ${home}; nothing was opened.`);
+      expect(() => target("./file", root)).toThrow("is a file, not a folder");
+    });
+  });
+
+  test("a sole bare word that names no folder stops with commands that recover in one step", () => {
+    withTree((root) => {
+      // The reported case: a folder name that is not there must not review the caller's repo.
+      expect(() => target("myproj", root)).toThrow(
+        `No folder "myproj" in ${root}; nothing was opened.\n` +
+          "Did you mean myproject? Run: plannotator review myproject\n" +
+          "To review the current project instead, run: plannotator review",
+      );
+      expect(() => target("please", root)).toThrow(
+        `No folder "please" in ${root}; nothing was opened.\n` +
+          "To review another folder, run: plannotator review <path to an existing folder>\n" +
+          "To review the current project instead, run: plannotator review",
+      );
+      // Flags are not words: the folder is still the sole word.
+      expect(() => target("--diff-type uncommitted myproj", root)).toThrow("Did you mean myproject?");
+      expect(() => target("staged", root)).toThrow("run: plannotator review --diff-type staged");
+      expect(() => target("1483", root)).toThrow("pass its URL: plannotator review https://github.com/<owner>/<repo>/pull/1483");
+    });
+  });
+
+  test("did you mean: a typo'd segment is matched against its parent's folders, as typed", () => {
+    withTree((root) => {
+      expect(() => target("src/componnets", root)).toThrow("Did you mean src/components? Run: plannotator review src/components");
+      expect(() => target("./src/compnents/", root)).toThrow("Did you mean ./src/components?");
+      expect(() => target("srx/components", root)).toThrow("Did you mean src/components?");
+      expect(() => target(join(root, "backnd"), root)).toThrow(`Did you mean ${join(root, "backend")}?`);
+      expect(() => target('"repo with spacs/"', root)).toThrow('Run: plannotator review "repo with spaces"');
+      // A file is not offered as a folder, and a far name is not offered at all.
+      expect(() => target("fil/", root)).toThrow("To review another folder");
+      expect(() => target("zzzzzz", root)).toThrow("To review another folder");
+    });
+  });
+
+  test("path-shaped prose among several words is ignored, not fatal (v0.27.23 regression)", () => {
+    withTree((root) => {
+      expect(target("review the frontend/backend split", root)).toEqual({
+        ignored: ["review", "the", "frontend/backend", "split"],
+      });
+      expect(target("look at the api/users code", root)).toEqual({
+        ignored: ["look", "at", "the", "api/users", "code"],
+      });
+      // A path-shaped word naming a file is prose too.
+      expect(target("look at ./file please", root)).toEqual({ ignored: ["look", "at", "./file", "please"] });
+      // An existing directory among the words still selects it.
+      expect(target("look at ./backend please", root)).toEqual({
+        directory: join(root, "backend"),
+        ignored: ["look", "at", "please"],
+      });
+      expect(target("./missing ./backend", root)).toEqual({ directory: join(root, "backend"), ignored: ["./missing"] });
+      // A path word next to a PR URL is not a sole target either.
+      expect(target("https://github.com/a/b/pull/1 ./missing", root)).toEqual({ ignored: ["./missing"] });
+    });
+  });
+
+  test("prose that names no directory falls back to the invoking cwd (#1483)", () => {
+    withTree((root) => {
+      expect(target("please review my changes", root)).toEqual({ ignored: ["please", "review", "my", "changes"] });
+      // A quoted sentence is one word, still prose; a sole bare word is a target.
+      expect(target('"please review my changes"', root)).toEqual({ ignored: ["please review my changes"] });
+      expect(() => target("focus", root)).toThrow('No folder "focus"');
+      // In prose a bare word that happens to match a directory never hijacks
+      // the review; a path-shaped word is the target.
+      expect(target("please review backend", root)).toEqual({ ignored: ["please", "review", "backend"] });
+      expect(target("please review ./backend", root)).toEqual({ directory: join(root, "backend"), ignored: ["please", "review"] });
+      expect(target("review https://github.com/a/b/pull/1 now", root)).toEqual({ ignored: ["review", "now"] });
+      expect(formatIgnoredReviewWords(target("please review", root))).toContain("please review");
+      expect(formatIgnoredReviewWords(target("backend", root))).toBeUndefined();
+    });
+  });
+
+  test("refuses two targets and a directory combined with --patch-file", () => {
+    withTree((root) => {
+      expect(() => target("./backend ./link", root)).toThrow("only one directory");
+      expect(() => target("./backend https://github.com/a/b/pull/1", root)).toThrow("only one directory");
+      expect(() => target("backend --patch-file change.patch", root)).toThrow("--patch-file cannot be combined with a review directory");
+      // Prose alongside --patch-file stays tolerated.
+      expect(target("please --patch-file change.patch", root)).toEqual({ ignored: ["please"] });
+    });
+  });
+
+  test("labels targeted feedback without turning a bare approval into approval-with-notes", () => {
+    expect(withReviewDirectory("Fix this", "/other/repo")).toContain("/other/repo\n\nFix this");
+    expect(withReviewDirectory("", "/other/repo")).toBe("");
+    expect(withReviewDirectory("Fix this")).toBe("Fix this");
   });
 });

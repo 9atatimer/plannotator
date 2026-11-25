@@ -1,16 +1,24 @@
 import type { DiagramAnchor } from '@plannotator/core/diagram-anchor';
-import type { DiagramRenderKind } from '@plannotator/core/annotatable';
+import type { ImageRegion } from '@plannotator/core/image-region';
+import type { HtmlBlockAnchor } from '@plannotator/core/html-block-anchor';
+import type { HtmlAnchorStructure } from '@plannotator/core/html-anchor';
+import type { DocumentRenderKind } from '@plannotator/core/annotatable';
+import type { QuestionAnswer } from '@plannotator/core/question-block';
 
 export type { DiagramAnchor } from '@plannotator/core/diagram-anchor';
-export type { DiagramRenderKind } from '@plannotator/core/annotatable';
+export type { ImageRegion, ImageRegionBox } from '@plannotator/core/image-region';
+export type { HtmlBlockAnchor } from '@plannotator/core/html-block-anchor';
+export type { QuestionAnswer } from '@plannotator/core/question-block';
+export type { DiagramRenderKind, DocumentRenderKind } from '@plannotator/core/annotatable';
 
 /**
  * How a document's body is rendered. `markdown` and `html` are the original
  * pair; the two diagram kinds are whole-file diagram sources (.mmd/.mermaid,
  * .dot/.gv) that render as ONE diagram through the same engine a ```mermaid
- * fence uses — see diagramDocumentBlocks in utils/parser.
+ * fence uses — see diagramDocumentBlocks in utils/parser. `asciidoc` is an
+ * .adoc source parsed by utils/asciidocParser into the same block model.
  */
-export type DocumentRenderAs = 'markdown' | 'html' | DiagramRenderKind;
+export type DocumentRenderAs = 'markdown' | 'html' | DocumentRenderKind;
 
 export enum AnnotationType {
   DELETION = 'DELETION',
@@ -37,6 +45,7 @@ export type WideModeType = 'wide' | 'focus';
 export interface ImageAttachment {
   path: string;
   name: string;
+  kind?: 'file';
 }
 
 /** DOM-relative text position used to restore a document annotation selection. */
@@ -100,6 +109,9 @@ export interface Annotation {
   elementContext?: HtmlElementContext; // raw-HTML / live-app pinpoint: bounded agent-facing description of the primary element (never used by restore)
   htmlAdditionalTargets?: HtmlAnnotationTarget[]; // raw-HTML shift-click multi-select: extra elements this one comment covers (primary stays htmlAnchor/originalText)
   diagramAnchor?: DiagramAnchor; // a comment on a rendered diagram part (Mermaid / Graphviz fence): the part's own id, label and document source line; the highlighter skips it and the diagram overlay restores it (see @plannotator/core/diagram-anchor)
+  htmlBlockAnchor?: HtmlBlockAnchor; // a comment on an element of a live `html` block in the document (the Inbox's messages): which block (its place, its embed id, its fence's lines); the element is `htmlAnchor` / `elementContext` inside that block's page. The highlighter skips it and the block's own viewer restores it (see @plannotator/core/html-block-anchor)
+  imageRegion?: ImageRegion; // a comment on part of an image in a markdown document (#2100): the image's src as written, its document line, and the box in the image's own pixels; drawn by the image viewer, skipped by the highlighter, exported as `Image:` / `Region:` lines (see @plannotator/core/image-region)
+  questionAnswer?: QuestionAnswer; // the reviewer's answer to a `:::question` block (id `ann-question-<key>`): the Viewer draws the answer from it, the highlighter skips it, and the export prints it in the "Answers to your questions" section instead of as a numbered comment (see @plannotator/core/question-block)
   // web-highlighter metadata for cross-element selections
   startMeta?: AnnotationTextMeta;
   endMeta?: AnnotationTextMeta;
@@ -125,6 +137,14 @@ export interface HtmlElementAnchor {
    * target rect center.
    */
   point?: { x: number; y: number };
+  /**
+   * A structural anchor, for an element with no text and no stable id: its
+   * place in a document that has not changed by a byte, and its signature
+   * (`@plannotator/core/html-anchor` `HtmlAnchorStructure`). Only from a
+   * viewer with `structuralAnchors`; restore takes the element only on an
+   * exact match and never one nearby.
+   */
+  structure?: HtmlAnchorStructure;
 }
 
 /**
@@ -185,6 +205,10 @@ export interface HtmlElementContext {
   component?: string;
   /** Live-app sessions only: the route the element was seen on and the page title. */
   page?: { url: string; title?: string };
+  /** Media elements only: the file the element shows, resolved by the bridge
+   *  exactly as the composer quote names it (src, data-src, srcset,
+   *  <picture>/<source>, poster), query and fragment scrubbed. */
+  sourceName?: string;
 }
 
 export type AlertKind = 'note' | 'tip' | 'warning' | 'caution' | 'important';
@@ -200,8 +224,17 @@ export interface Block {
   orderedStart?: number; // For ordered list items: integer parsed from the marker (e.g. 5 for "5.")
   alertKind?: AlertKind; // For blockquotes starting with [!NOTE] / [!TIP] / etc.
   directiveKind?: string; // For directive containers (e.g. ':::note' → 'note')
+  /**
+   * Set on a GFM footnote definition (`[^label]: …`, with its indented
+   * continuation lines): the label as written. The block is a 'paragraph'
+   * whose `content` is the definition's source, marker included, so a surface
+   * that does not draw footnotes shows it as written. Footnote-aware surfaces
+   * (`utils/footnotes.ts`) draw it in the notes list at the end instead.
+   */
+  footnoteLabel?: string;
   order: number; // Sorting order
   startLine: number; // 1-based line number in source
+  blankLinesBefore?: number; // Paragraph only, with parse option keepBlankLines: the blank lines (2+) typed before it
   sourceLineCount?: number; // Number of source lines consumed when it differs from content lines
   /**
    * Line offset a diagram comment's `sourceLine` is measured from, when it
@@ -213,6 +246,14 @@ export interface Block {
    * `(lines a–b)` label.
    */
   diagramSourceLineOffset?: number;
+  /**
+   * Set on a whole-file code document (`renderAs: "code"`, see
+   * `codeDocumentBlocks`): the document line of `content`'s first character.
+   * The file is ONE block, so a comment's line label is counted from its
+   * position inside `content`, not the block's span (which would name every
+   * line). Unset everywhere else, so other labels stay as they were.
+   */
+  contentStartLine?: number;
 }
 
 export interface DiffResult {
@@ -348,8 +389,10 @@ export interface CodeAnnotation {
   gitButlerBase?: string;
   /** Exact server snapshot that supplied the GitButler line coordinates. */
   gitButlerSnapshotId?: string;
+  /** Local Git worktree + branch + comparison identity supplied by the server. */
+  localReviewTarget?: string;
   /**
-   * PR reviews only (#1590): the text of the diff lines this line comment
+   * PR and local Git reviews (#1590): the text of the diff lines this line comment
    * was anchored to at creation (lineStart..lineEnd on `side`, joined with
    * "\n"). When a saved draft is restored against a different patch, the
    * comment keeps its position only if these lines still read the same;
@@ -358,7 +401,7 @@ export interface CodeAnnotation {
    */
   anchorText?: string;
   /**
-   * PR reviews only (#1590): the lines around the anchor on the same side
+   * PR and local Git reviews (#1590): the lines around the anchor on the same side
    * (up to two before and two after; `null` where a line is outside the patch
    * hunks) and the hunk header's function context (`hunk`, when git printed
    * one), so a comment on a common line (`}`, `return null;`) only keeps its
@@ -366,19 +409,52 @@ export interface CodeAnnotation {
    */
   anchorContext?: { before: (string | null)[]; after: (string | null)[]; hunk?: string };
   /**
-   * PR reviews only (#1590): the review snapshot id of the diff whose line
+   * PR and local Git reviews (#1590): the review snapshot id of the diff whose line
    * coordinates this comment uses. Re-stamped when a later diff passes the
    * anchor check; a line comment is only posted inline when this matches the
    * diff currently known for its PR.
    */
   anchorSnapshot?: string;
   /**
-   * Set when a restored PR draft's comment no longer matches the code it was
-   * written on (the PR changed between sessions). Its line numbers refer to
+   * Set when a comment no longer matches the code it was written on.
+   * Its line numbers refer to
    * the earlier version: it is listed and exported (labelled) but never drawn
    * inline on the current diff and never posted as an inline PR comment.
    */
   outdated?: boolean;
+  /**
+   * Code review only: a comment on lines outside the diff — a file the review
+   * does not change (opened from All files), or lines of a changed file
+   * outside its hunks (its Whole file view). Line-scoped on the new side,
+   * with the commented code in `anchorText`. The agent gets it with the file,
+   * lines and code; a PR review posts it in the review body with the quoted
+   * code and a permalink, never inline (no platform accepts an inline comment
+   * outside the PR's diff). Never marked outdated by a diff re-check.
+   * Additive: annotations without it behave exactly as before.
+   */
+  outsideDiff?: boolean;
+  /**
+   * Code review only: a comment made by selecting text in a Markdown file's
+   * rendered preview. Always file-scoped (`scope: 'file'`); `lineStart` /
+   * `lineEnd` are the file-comment sentinels, not source lines. Exported with
+   * the quoted text; in PR mode it goes into the review body, never inline.
+   * Additive: annotations without it behave exactly as before.
+   */
+  markdownPreview?: MarkdownPreviewAnchor;
+}
+
+/** Where a comment made in a rendered Markdown preview points (see `CodeAnnotation.markdownPreview`). */
+export interface MarkdownPreviewAnchor {
+  /** The rendered text the reviewer selected. */
+  originalText: string;
+  /** The preview view it was made in: the rendered diff or the whole new version. */
+  view: 'diff' | 'whole';
+  /** In the rendered diff: the kind of section the selection started in. */
+  diffContext?: 'added' | 'removed' | 'modified' | 'unchanged';
+  /** web-highlighter positions, valid only in the view it was made in;
+   *  other views re-anchor by text. */
+  startMeta?: AnnotationTextMeta;
+  endMeta?: AnnotationTextMeta;
 }
 
 /** Token-level metadata passed from selection to annotation creation. */
@@ -417,7 +493,9 @@ export interface DiffAnnotationMetadata {
    *  the projected metadata, not the full annotation. */
   copyText?: string;
   // AI marker fields (set when kind === 'ai-marker')
-  kind?: 'annotation' | 'ai-marker';
+  kind?: 'annotation' | 'ai-marker' | 'host-note' | 'context-note';
+  /** A host's context note (kind === 'context-note'; review-editor's `contextNotes`): never a comment. */
+  contextNoteId?: string;
   questionId?: string;
   promptPreview?: string;
   hasResponse?: boolean;
@@ -443,6 +521,15 @@ export interface AIQuestion {
     label?: string;
     text?: string;
     sourcePath?: string;
+    /** Agent-facing identity of the selected element(s) (raw-HTML / live-app
+     *  pinpoints): sent with the question, never shown in the chat. */
+    detail?: string;
+    /** 1-based source lines of a text selection in a markdown document (the
+     *  enclosing block's span, or first to last block for a selection over
+     *  several). `buildDefaultPrompt` appends them to the `Source:` line
+     *  (`, line 41` / `, lines 41–44`). Optional: absent prints no lines. */
+    lineStart?: number;
+    lineEnd?: number;
   };
   /** undefined = general question (no file scope) */
   filePath?: string;
@@ -459,6 +546,16 @@ export interface AIResponse {
   text: string;
   isStreaming: boolean;
   error?: string;
+  /** Server error code with `error` (e.g. `agent_busy`, `session_gone` from "Ask this session"). */
+  errorCode?: string;
+  /** "Ask this session": the question is waiting for a busy session, or interrupting it. */
+  status?: 'waiting' | 'interrupting';
+  /**
+   * "Ask this session": a note shown under the answer (not an error). Set when
+   * the person typed into the session while it answered, so the answer stops
+   * where their prompt took the turn over.
+   */
+  notice?: string;
   createdAt: number;
 }
 
@@ -494,3 +591,29 @@ export type {
   MentionSource,
   MentionTrigger,
 } from './utils/mentions';
+
+/**
+ * The composer handed to the host (opt-in `onHostDraft` on `Viewer` and
+ * `HtmlViewer`; Plannotator supplies neither). With it a viewer draws no
+ * toolbar or composer of its own: it reports what a comment would be on, and
+ * the host writes the comment, saves it, and draws it as saved through
+ * `annotations` or `applySharedAnnotations`.
+ */
+export interface HostDraft {
+  /** The annotation a comment here would carry, with an empty `text`. */
+  annotation: Annotation;
+  /**
+   * `'selection'`: a text selection settled; the host offers its own Comment
+   * (a phone's edit menu). `'compose'`: open the composer now (a pinpoint
+   * tap, Comment mode, an HTML pin).
+   */
+  intent: 'selection' | 'compose';
+  /** What it is on, as a composer names it (Plannotator's pinpoint label: "Button", a heading's words). Absent for text. */
+  label?: string;
+  /**
+   * Drop the draft: its pending highlight or pin goes. The host calls it when
+   * the person cancels, and after the save, before it draws the saved
+   * annotation. A draft already replaced by a newer one ignores it.
+   */
+  cancel: () => void;
+}

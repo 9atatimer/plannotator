@@ -6,15 +6,20 @@ import {
   isFramedEmbeddedDocumentRequest,
   isFramedFetchDest,
   pathNamesEmbeddedDocument,
+  refusesHiddenHtmlAssetPath,
   rewriteCssAssetReferences,
   normalizeHtmlAssetRoutePath,
   resolveHtmlAssetRoute,
   rewriteHtmlAssetReferences,
   HTML_ASSET_DOCUMENT_CONTENT_TYPE,
   HTML_ASSET_DOCUMENT_CSP,
+  HTML_NO_NETWORK_MARKER,
   INERT_HTML_BASE_HREF,
+  prependNoNetworkMarker,
   MAX_HTML_ASSET_DOCUMENT_BYTES,
 } from "./html-assets";
+// The viewer that reads the marker (the server writes it, the frame obeys it).
+import { hasNoNetworkMarker, injectNoNetworkCsp, NO_NETWORK_CSP_META } from "../ui/components/html-viewer/srcdoc";
 
 describe("rewriteHtmlAssetReferences", () => {
   const rewrite = (html: string) =>
@@ -151,6 +156,35 @@ describe("embedded local documents", () => {
     expect(rewriteBase('<html><head><base href="/assets/"></head></html>')).toContain('<base href="/assets/">');
   });
 
+  // A document opened outside the session's roots: the HTML viewer turns the
+  // marker into connect-src 'none' for its srcdoc frame.
+  test("noNetwork marks the document in head, after the base, in the form the viewer reads", () => {
+    const out = rewriteHtmlAssetReferences(
+      '<!doctype html><html><head><title>x</title><script>fetch("/x")</script></head><body></body></html>',
+      () => null,
+      { baseHref: "/api/html-assets/tok/", noNetwork: true },
+    );
+    expect(out).toContain(`<head><base href="/api/html-assets/tok/">${HTML_NO_NETWORK_MARKER}<title>`);
+    expect(hasNoNetworkMarker(out)).toBe(true);
+    // A fragment has no head: the marker still lands in it.
+    expect(hasNoNetworkMarker(rewriteHtmlAssetReferences("<p>hi</p>", () => null, { noNetwork: true }))).toBe(true);
+  });
+
+  // A document the rewrite could not read still gets the marker, after its
+  // doctype: first, it would put the page in quirks mode.
+  test("the unparsed fallback keeps the doctype first, so the page stays in standards mode", () => {
+    const out = prependNoNetworkMarker('\uFEFF<!-- built --><!DOCTYPE html><html><head><script>fetch("/x")</script></head></html>');
+    expect(out).toBe(`\uFEFF<!-- built --><!DOCTYPE html>${HTML_NO_NETWORK_MARKER}<html><head><script>fetch("/x")</script></head></html>`);
+    expect(injectNoNetworkCsp(out).startsWith(`\uFEFF<!-- built --><!DOCTYPE html>${NO_NETWORK_CSP_META}`)).toBe(true);
+    expect(prependNoNetworkMarker("<p>no doctype</p>")).toBe(`${HTML_NO_NETWORK_MARKER}<p>no doctype</p>`);
+    expect(hasNoNetworkMarker(prependNoNetworkMarker("<p>x</p>"))).toBe(true);
+  });
+
+  test("without noNetwork the document carries no marker", () => {
+    const out = rewriteBase('<!doctype html><html><head><title>x</title></head><body></body></html>');
+    expect(hasNoNetworkMarker(out)).toBe(false);
+  });
+
   test("a rewrite with no base option is byte-identical to the unoptioned rewrite", () => {
     const html = '<!doctype html><html><head><title>x</title></head><body><img src="a.png"></body></html>';
     const mapper = (p: string) => `/api/html-assets/t/${p}`;
@@ -268,5 +302,19 @@ describe("isFramedEmbeddedDocumentRequest", () => {
     expect(isFramedEmbeddedDocumentRequest("iframe", "/")).toBe(false);
     expect(isFramedEmbeddedDocumentRequest("document", "/gone.html")).toBe(false);
     expect(isFramedEmbeddedDocumentRequest(null, "/gone.html")).toBe(false);
+  });
+});
+
+describe("refusesHiddenHtmlAssetPath", () => {
+  test("refuses hidden files, hidden folders and the dotenv family", () => {
+    for (const path of [".hidden.css", ".secrets/creds.json", "assets/.git/config.json", "nested\\.ssh\\id.txt", "config/prod.env", ".envrc", ".env.local"]) {
+      expect(refusesHiddenHtmlAssetPath(path), path).toBe(true);
+    }
+  });
+
+  test("serves ordinary asset paths", () => {
+    for (const path of ["assets/lesson.css", "lessons/quiz.js", "img/a.b.png", "env/settings.json"]) {
+      expect(refusesHiddenHtmlAssetPath(path), path).toBe(false);
+    }
   });
 });

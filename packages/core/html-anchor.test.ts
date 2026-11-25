@@ -17,6 +17,12 @@ import {
   DEFAULT_HTML_ANCHOR_MAX_BYTES,
   MAX_ELEMENT_CONTEXT_BYTES,
   MAX_HTML_ADDITIONAL_TARGETS,
+  MAX_HTML_STRUCTURE_ATTR_NAME_LENGTH,
+  MAX_HTML_STRUCTURE_ATTR_VALUE_LENGTH,
+  MAX_HTML_STRUCTURE_ATTRS,
+  MAX_HTML_STRUCTURE_PATH_DEPTH,
+  parseHtmlAnchorStructure,
+  parseHtmlElementAnchor,
   parseHtmlElementContext,
   projectHostThreads,
   type HostThread,
@@ -448,5 +454,85 @@ describe("parseHtmlElementContext", () => {
     });
     expect(oversized).toBeDefined();
     expect(bytes(oversized)).toBeLessThanOrEqual(MAX_ELEMENT_CONTEXT_BYTES);
+  });
+
+  // Failure to catch: an image pin on a long live-app route whose context
+  // only fits WITHOUT `sourceName` being dropped whole (undefined) because
+  // `sourceName` was not in the shed order.
+  test("an oversized context sheds sourceName before it drops the whole context", () => {
+    const base = { tag: "img", role: "img", name: "Hero" };
+    const sourceName = "hero-banner-with-a-long-name.webp";
+    // A route sized so the context fits with a few bytes to spare, then
+    // overflows once sourceName rides along.
+    const slack = 8;
+    const urlLength = MAX_ELEMENT_CONTEXT_BYTES - bytes({ ...base, page: { url: "" } }) - slack;
+    const page = { url: `/${"r".repeat(urlLength - 1)}` };
+    expect(bytes({ ...base, page })).toBeLessThanOrEqual(MAX_ELEMENT_CONTEXT_BYTES);
+    expect(bytes({ ...base, sourceName, page })).toBeGreaterThan(MAX_ELEMENT_CONTEXT_BYTES);
+
+    const shed = parseHtmlElementContext({ ...base, sourceName, page });
+    expect(shed).toBeDefined();
+    expect(shed?.sourceName).toBeUndefined();
+    expect(shed?.page?.url).toBe(page.url);
+    expect(shed?.name).toBe("Hero");
+
+    // With room to spare it is kept.
+    expect(parseHtmlElementContext({ ...base, sourceName, page: { url: "/home" } })?.sourceName).toBe(sourceName);
+  });
+});
+
+// A structural anchor comes from a page (the bridge runs in it): the window
+// takes only one that is whole and inside the caps, and never cuts one to fit.
+describe("parseHtmlElementAnchor: structural anchors", () => {
+  const structure = {
+    path: [1, 0, 14],
+    ns: "http://www.w3.org/2000/svg",
+    attrs: [["aria-label", "Pro, W3"], ["d", "9c1f0a2b", 5000], ["fill", "var(--chart-2)"]],
+  };
+  const anchor = (over: Record<string, unknown> = {}) => parseHtmlElementAnchor({ selector: "svg > rect:nth-of-type(9)", tagName: "rect", structure: { ...structure, ...over } });
+
+  test("a whole one is kept as it is, unknown keys dropped", () => {
+    expect(anchor({ extra: "x" })).toEqual({ selector: "svg > rect:nth-of-type(9)", tagName: "rect", structure });
+    expect(parseHtmlAnchorStructure(structure)).toEqual(structure);
+  });
+
+  test("oversized: the whole anchor is rejected, nothing is cut to fit", () => {
+    expect(anchor({ path: Array(MAX_HTML_STRUCTURE_PATH_DEPTH + 1).fill(0) })).toBeNull();
+    expect(anchor({ path: [] })).toBeNull();
+    expect(anchor({ attrs: Array.from({ length: MAX_HTML_STRUCTURE_ATTRS + 1 }, (_, i) => [`a${String(i).padStart(2, "0")}`, "v"]) })).toBeNull();
+    expect(anchor({ attrs: [["a".repeat(MAX_HTML_STRUCTURE_ATTR_NAME_LENGTH + 1), "v"]] })).toBeNull();
+    expect(anchor({ attrs: [["fill", "v".repeat(MAX_HTML_STRUCTURE_ATTR_VALUE_LENGTH + 1)]] })).toBeNull();
+    expect(anchor({ ns: "n".repeat(65) })).toBeNull();
+    // At the caps it is still one.
+    expect(anchor({ path: Array(MAX_HTML_STRUCTURE_PATH_DEPTH).fill(0), attrs: [["fill", "v".repeat(MAX_HTML_STRUCTURE_ATTR_VALUE_LENGTH)]] })).not.toBeNull();
+  });
+
+  test("forged: wrong shapes are rejected", () => {
+    for (const over of [
+      { path: [1, -1] },
+      { path: [1.5] },
+      { path: ["1"] },
+      { path: "1,0" },
+      { ns: 7 },
+      { attrs: "fill" },
+      { attrs: [["fill"]] },
+      { attrs: [["fill", 3]] },
+      { attrs: [["", "v"]] },
+      // One spelling per signature: sorted, each name once.
+      { attrs: [["fill", "a"], ["aria-label", "b"]] },
+      { attrs: [["fill", "a"], ["fill", "b"]] },
+      // A digest stands only for a value too long to keep, and is hex.
+      { attrs: [["d", "9c1f0a2b", 12]] },
+      { attrs: [["d", "not hex!", 5000]] },
+      { attrs: [["d", "9c1f0a2b", 1e12]] },
+    ]) {
+      expect(anchor(over)).toBeNull();
+    }
+    expect(parseHtmlElementAnchor({ selector: "rect", tagName: "rect", structure: [] })).toBeNull();
+    expect(parseHtmlElementAnchor({ selector: "rect", tagName: "rect", structure: null })).toBeNull();
+  });
+
+  test("an anchor without one is unchanged", () => {
+    expect(parseHtmlElementAnchor({ selector: "#a", tagName: "p", text: "t" })).toEqual({ selector: "#a", tagName: "p", text: "t" });
   });
 });

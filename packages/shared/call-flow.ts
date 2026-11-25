@@ -2,10 +2,13 @@
  * Isolated CallDiff execution over immutable review snapshots.
  *
  * CallDiff is a Node-native, synchronous Tree-sitter library. Plannotator runs
- * it in a short-lived Node 22 worker and never imports it into Bun or Pi.
+ * it in a short-lived Node worker (22.18 or newer) and never imports it into
+ * Bun or Pi.
  */
+import { childEnv } from "./child-env";
 import { createHash } from "node:crypto";
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import type { Dirent } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
@@ -23,6 +26,7 @@ import {
 } from "./call-flow-languages";
 import type { CallFlowLanguageDefinition, CallFlowLanguageId } from "./call-flow-languages";
 import { getPlannotatorDataDir } from "./data-dir";
+import { gitColorFreeEnvironment } from "./review-core";
 import { indexCallFlowImpacts, parseCallDiffWorkerResult } from "./call-flow-types";
 import type {
   CallFlowAdvert,
@@ -31,11 +35,14 @@ import type {
   ParsedCallDiffWorkerResult,
 } from "./call-flow-types";
 
-export const CALLDIFF_VERSION = "0.4.1";
-export const CALLDIFF_COMMIT = "a3194d20ca91ef6a314273d634e9b9c0db1c2707";
+export const CALLDIFF_VERSION = "0.6.0";
+export const CALLDIFF_COMMIT = "2086f6e4e9ed3c410bba7c94ca3dde77791b1956";
 export const CALLDIFF_SOURCE_SPEC = `https://github.com/tanishqkancharla/calldiff/archive/${CALLDIFF_COMMIT}.tar.gz`;
-export const CALLDIFF_SOURCE_INTEGRITY = "sha512-5y6tjre5UE00qPrVFPurnk9RBdk8WlRok+0w41lxLt1MyPLOlNUEaAT2/j/nz2xWlhDm3DfDYvW/5KBD2b9TLg==";
+export const CALLDIFF_SOURCE_INTEGRITY = "sha512-t+YCPz0WkETiwSOznwx3mLxVkEUe7DVACV+it2HJER7q/ha+K0IavN9IfBvP+7/ijzPXoUHgJIkAM/kg1O5S6A==";
 export const CALLDIFF_TREE_SITTER_VERSION = "0.25.1";
+/** CallDiff's own `engines.node` floor at the pinned commit (>=22.18.0). */
+export const CALL_FLOW_MIN_NODE_VERSION = { major: 22, minor: 18 } as const;
+const CALL_FLOW_NODE_REQUIREMENT = "Node.js 22.18 or newer";
 const CALLDIFF_ARCHIVE_FILE = `calldiff-${CALLDIFF_COMMIT}.tar.gz`;
 const MAX_CALLDIFF_ARCHIVE_BYTES = 20 * 1024 * 1024;
 const MAX_PACK_ARCHIVES_BYTES = 256 * 1024 * 1024;
@@ -63,7 +70,15 @@ const CORE_PRUNED_PACKAGES = [
 
 const WORKER_TIMEOUT_MS = 45_000;
 const GIT_TIMEOUT_MS = 20_000;
-const MAX_PROCESS_OUTPUT_BYTES = 12 * 1024 * 1024;
+const DEFAULT_OUTPUT_MIB = 12;
+const MAX_PROCESS_OUTPUT_BYTES = DEFAULT_OUTPUT_MIB * 1024 * 1024;
+const DEFAULT_CALLDIFF_DEPTH = 10;
+
+function workerInteger(value: string | undefined, fallback: number, min: number, max: number): number {
+  const text = value?.trim();
+  const number = text && /^\d+$/.test(text) ? Number(text) : NaN;
+  return number >= min && number <= max ? number : fallback;
+}
 
 export interface CallFlowAnalysisInput {
   snapshotId: string;
@@ -108,6 +123,8 @@ interface CommandResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  stdoutBytes: number;
+  stderrBytes: number;
   timedOut: boolean;
   outputLimitExceeded: boolean;
   aborted: boolean;
@@ -245,11 +262,23 @@ function hasCommittedRuntimeLock(runtimeDir: string): boolean {
   }
 }
 
-async function checkNode22(nodePath: string): Promise<{ ok: true } | { ok: false; message: string }> {
+/** True when a `node --version` string meets CallDiff's 22.18 floor. */
+export function callFlowNodeVersionSupported(version: string): boolean {
+  const match = /^v?(\d+)\.(\d+)/.exec(version.trim());
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const floor = CALL_FLOW_MIN_NODE_VERSION;
+  return major > floor.major || (major === floor.major && minor >= floor.minor);
+}
+
+async function checkCallFlowNode(nodePath: string): Promise<{ ok: true } | { ok: false; message: string }> {
   const result = await runCommand(nodePath, ["--version"], { timeoutMs: 3_000 });
-  const match = /^v(\d+)/.exec(result.stdout.trim());
-  if (result.exitCode !== 0 || !match) return { ok: false, message: "Node.js could not be started." };
-  if (Number(match[1]) < 22) return { ok: false, message: `Node.js 22 or newer is required (found ${result.stdout.trim()}).` };
+  const found = result.stdout.trim();
+  if (result.exitCode !== 0 || !/^v\d+\.\d+/.test(found)) return { ok: false, message: "Node.js could not be started." };
+  if (!callFlowNodeVersionSupported(found)) {
+    return { ok: false, message: `Call flow needs ${CALL_FLOW_NODE_REQUIREMENT}. You have Node.js ${found}.` };
+  }
   return { ok: true };
 }
 
@@ -276,8 +305,8 @@ function findExecutable(name: string): string | null {
  */
 export async function preflightCallFlowNode(): Promise<CallFlowNodePreflight> {
   const nodePath = findExecutable("node");
-  if (!nodePath) return { ok: false, reason: "node-unavailable", message: "Call flow requires Node.js 22 or newer, which was not found on PATH." };
-  const nodeCheck = await checkNode22(nodePath);
+  if (!nodePath) return { ok: false, reason: "node-unavailable", message: `Call flow needs ${CALL_FLOW_NODE_REQUIREMENT}, which was not found on PATH.` };
+  const nodeCheck = await checkCallFlowNode(nodePath);
   if (!nodeCheck.ok) return { ok: false, reason: "node-version", message: nodeCheck.message };
   return { ok: true };
 }
@@ -285,8 +314,8 @@ export async function preflightCallFlowNode(): Promise<CallFlowNodePreflight> {
 /** Resolve the pruned core and report independently installed language packs. */
 export async function resolveCallFlowRuntime(): Promise<CallFlowRuntimeResolution> {
   const nodePath = findExecutable("node");
-  if (!nodePath) return { ok: false, reason: "node-unavailable", message: "Call flow requires Node.js 22 or newer." };
-  const nodeCheck = await checkNode22(nodePath);
+  if (!nodePath) return { ok: false, reason: "node-unavailable", message: `Call flow needs ${CALL_FLOW_NODE_REQUIREMENT}, which was not found on PATH.` };
+  const nodeCheck = await checkCallFlowNode(nodePath);
   if (!nodeCheck.ok) return { ok: false, reason: "node-version", message: nodeCheck.message };
 
   const override = process.env.PLANNOTATOR_CALLDIFF_PATH?.trim();
@@ -656,6 +685,9 @@ for (const file of request.files) mod.extractFunctions(file, "");
       maxOutputBytes: 1024 * 1024,
       env: {
         ...process.env,
+        // CallDiff runs git itself; keep a user's `color.diff = always` from
+        // wrapping its diff in ANSI escapes (#1661).
+        ...gitColorFreeEnvironment(process.env),
         PATH: `${npmBlocker.path}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
         CALLDIFF_GRAMMAR_CACHE: grammarCacheDir,
         npm_config_offline: "true",
@@ -680,29 +712,125 @@ function ensureGrammarCacheManifest(cacheDir: string): void {
   }), "utf8");
 }
 
-async function preserveValidatedLanguagePacks(
+/**
+ * Copy optional packs into a candidate core. Sources are tried in order (the
+ * current runtime first, then folders left by older pins); a pack crosses only
+ * when its exact committed lock marker matches and it loads through the
+ * candidate core. Packs are pinned independently of CallDiff, so an upgrade
+ * keeps the user's installed languages instead of downloading them again.
+ */
+export async function preserveValidatedLanguagePacks(
   nodePath: string,
-  currentRuntimeDir: string,
+  sourceRuntimeDirs: readonly string[],
   candidateRuntimeDir: string,
-): Promise<void> {
+): Promise<CallFlowLanguageId[]> {
   const candidateCache = getCallFlowGrammarCacheDir(candidateRuntimeDir);
   ensureGrammarCacheManifest(candidateCache);
+  const preserved: CallFlowLanguageId[] = [];
   for (const language of CALL_FLOW_LANGUAGES) {
-    if (language.kind !== "pack" || !isLanguageInstalled(currentRuntimeDir, language, true)) continue;
+    if (language.kind !== "pack") continue;
     const packId = language.id as Exclude<CallFlowLanguageId, "javascript-typescript">;
-    const currentRoot = getLanguagePackageRoot(currentRuntimeDir, language);
     const candidateRoot = getLanguagePackageRoot(candidateRuntimeDir, language);
-    mkdirSync(dirname(candidateRoot), { recursive: true });
-    cpSync(currentRoot, candidateRoot, { recursive: true, force: true });
+    for (const sourceRuntimeDir of sourceRuntimeDirs) {
+      if (!isLanguageInstalled(sourceRuntimeDir, language, true)) continue;
+      mkdirSync(dirname(candidateRoot), { recursive: true });
+      cpSync(getLanguagePackageRoot(sourceRuntimeDir, language), candidateRoot, { recursive: true, force: true });
+      try {
+        await validatePrunedLanguage(nodePath, candidateRuntimeDir, candidateCache, [language.id]);
+        const marker = getLanguageLockMarker(candidateRuntimeDir, language.id);
+        mkdirSync(dirname(marker), { recursive: true });
+        writeFileSync(marker, runtimeJson(CALL_FLOW_PACK_LOCKS[packId]), "utf8");
+        preserved.push(language.id);
+        break;
+      } catch {
+        // A pack whose files no longer load is not independently verified and
+        // must not cross the atomic core repair boundary.
+        removeDirectoryStrict(candidateRoot);
+      }
+    }
+  }
+  return preserved;
+}
+
+/**
+ * Folder names Plannotator itself creates for a managed core: the published
+ * `calldiff-<version>` and the `.previous-<pid>-<ms>` backup a core swap
+ * leaves when it is interrupted. Nothing else in vendor/call-flow matches.
+ */
+const MANAGED_CORE_DIR_PATTERN = /^calldiff-(\d+)\.(\d+)\.(\d+)(\.previous-\d+-\d+)?$/;
+
+function compareVersionTriples(a: readonly number[], b: readonly number[]): number {
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return 0;
+}
+
+/**
+ * Managed core folders under this data dir that no current or newer
+ * Plannotator uses: cores of an older CallDiff pin, and interrupted-swap
+ * backups of an older or the current pin. A newer pin's folder and backups
+ * are kept, so downgrading and upgrading again finds it still installed.
+ */
+export function listStaleCallFlowRuntimeDirs(dataDir = getPlannotatorDataDir()): string[] {
+  const currentDir = getCallFlowManagedRuntimeDir(dataDir);
+  const parent = dirname(currentDir);
+  const current = CALLDIFF_VERSION.split(".").map(Number);
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(parent, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const stale: string[] = [];
+  for (const entry of entries) {
+    // Dirent types come from lstat: a symlink is never followed or removed.
+    if (!entry.isDirectory()) continue;
+    const match = MANAGED_CORE_DIR_PATTERN.exec(entry.name);
+    if (!match) continue;
+    const isBackup = match[4] !== undefined;
+    const version = [Number(match[1]), Number(match[2]), Number(match[3])];
+    const order = compareVersionTriples(version, current);
+    if (order < 0 || (isBackup && order === 0)) stale.push(join(parent, entry.name));
+  }
+  return stale.sort();
+}
+
+/**
+ * A stale core is renamed to this dot-prefixed name before it is deleted. No
+ * Plannotator version resolves a dot-prefixed folder, so a delete cut short
+ * (a killed process, a busy file on Windows) never leaves a half-deleted
+ * `calldiff-<x.y.z>` that an older Plannotator would take as installed.
+ */
+const STALE_TOMBSTONE_PATTERN = /^\.calldiff-stale-\d+-\d+-\d+$/;
+
+/**
+ * Remove stale managed cores once the current pin is published. Runs only
+ * under the install lease and only after a successful install, so a failed
+ * upgrade keeps the previous folder for a downgrade. Each folder is first
+ * renamed to a tombstone (atomic); one that cannot be renamed (in use on
+ * Windows) stays whole and is retried by the next install. Tombstones,
+ * including any an earlier interrupted delete left, are then removed.
+ */
+export function removeStaleCallFlowRuntimeDirs(dataDir = getPlannotatorDataDir()): void {
+  const parent = dirname(getCallFlowManagedRuntimeDir(dataDir));
+  const stamp = `${process.pid}-${Date.now()}`;
+  listStaleCallFlowRuntimeDirs(dataDir).forEach((path, index) => {
     try {
-      await validatePrunedLanguage(nodePath, candidateRuntimeDir, candidateCache, [language.id]);
-      const marker = getLanguageLockMarker(candidateRuntimeDir, language.id);
-      mkdirSync(dirname(marker), { recursive: true });
-      writeFileSync(marker, runtimeJson(CALL_FLOW_PACK_LOCKS[packId]), "utf8");
+      renameSync(path, join(parent, `.calldiff-stale-${stamp}-${index}`));
     } catch {
-      // A pack whose files no longer load is not independently verified and
-      // must not cross the atomic core repair boundary.
-      removeDirectoryStrict(candidateRoot);
+      // Left whole under its own name; the next install tries again.
+    }
+  });
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(parent, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory() && STALE_TOMBSTONE_PATTERN.test(entry.name)) {
+      removeDirectoryBestEffort(join(parent, entry.name));
     }
   }
 }
@@ -728,13 +856,14 @@ async function installCallFlowRuntimeUnlocked(
   const nodePath = findExecutable("node");
   const npmPath = findExecutable("npm");
   if (!nodePath || !npmPath) {
-    return { ok: false, status: "failed", runtimeDir, message: "Call-flow runtime requires Node.js 22+ and npm." };
+    return { ok: false, status: "failed", runtimeDir, message: `Call flow needs ${CALL_FLOW_NODE_REQUIREMENT} and npm on PATH.` };
   }
-  const nodeCheck = await checkNode22(nodePath);
+  const nodeCheck = await checkCallFlowNode(nodePath);
   if (!nodeCheck.ok) return { ok: false, status: "failed", runtimeDir, message: nodeCheck.message };
 
   const existing = await resolveCallFlowRuntime();
   if (existing.ok && existing.runtime.runtimeDir === runtimeDir) {
+    removeStaleCallFlowRuntimeDirs();
     return { ok: true, status: "already-installed", runtimeDir, languageId: CALL_FLOW_CORE_LANGUAGE_ID, message: `Call-flow core already installed at ${runtimeDir}.` };
   }
   const runtimeParent = dirname(runtimeDir);
@@ -797,10 +926,11 @@ async function installCallFlowRuntimeUnlocked(
     await validatePrunedLanguage(nodePath, installDir, getCallFlowGrammarCacheDir(installDir), [CALL_FLOW_CORE_LANGUAGE_ID]);
     const sizeAfterPruneBytes = measureCallFlowDirectoryBytes(installDir);
 
-    // A core repair preserves only packs whose exact marker, package version,
-    // and native payload all still validate against the candidate core.
+    // A core repair or upgrade preserves only packs whose exact marker,
+    // package version, and native payload all still validate against the
+    // candidate core. An upgrade takes them from the older pin's folder.
     const nextCache = getCallFlowGrammarCacheDir(installDir);
-    await preserveValidatedLanguagePacks(nodePath, runtimeDir, installDir);
+    await preserveValidatedLanguagePacks(nodePath, [runtimeDir, ...listStaleCallFlowRuntimeDirs()], installDir);
     ensureGrammarCacheManifest(nextCache);
 
     if (existsSync(runtimeDir)) renameSync(runtimeDir, backupDir);
@@ -811,6 +941,8 @@ async function installCallFlowRuntimeUnlocked(
       throw error;
     }
     removeDirectoryBestEffort(backupDir);
+    // Only now that the new pin is published do older pins' folders go.
+    removeStaleCallFlowRuntimeDirs();
     return { ok: true, status: "installed", runtimeDir, languageId: CALL_FLOW_CORE_LANGUAGE_ID, sizeBeforePruneBytes, sizeAfterPruneBytes, message: `Installed the pruned CallDiff ${CALLDIFF_VERSION} core at ${runtimeDir}.` };
   } catch (error) {
     return {
@@ -855,7 +987,7 @@ async function installCallFlowLanguagePackUnlocked(
   const nodePath = findExecutable("node");
   const npmPath = findExecutable("npm");
   if (!nodePath || !npmPath) {
-    return { ok: false, status: "failed", runtimeDir, message: "Call-flow language packs require Node.js 22+ and npm." };
+    return { ok: false, status: "failed", runtimeDir, message: `Call flow language support needs ${CALL_FLOW_NODE_REQUIREMENT} and npm on PATH.` };
   }
   const runtime = await resolveCallFlowRuntime();
   if (!runtime.ok || !runtime.runtime.managed || runtime.runtime.runtimeDir !== runtimeDir) {
@@ -974,6 +1106,7 @@ async function runCommand(
         if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
         else if (process.platform === "win32" && child.pid) {
           const killed = spawnSync("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
+            env: childEnv(),
             stdio: "ignore",
             windowsHide: true,
           });
@@ -1025,6 +1158,8 @@ async function runCommand(
         exitCode: exitCode ?? 1,
         stdout,
         stderr,
+        stdoutBytes,
+        stderrBytes,
         timedOut,
         outputLimitExceeded,
         aborted,
@@ -1094,17 +1229,22 @@ async function executeWorker(
   languageIds: readonly CallFlowLanguageId[],
   signal: AbortSignal,
 ): Promise<ParsedCallDiffWorkerResult> {
+  const maxDepth = workerInteger(process.env.PLANNOTATOR_CALLDIFF_MAX_DEPTH, DEFAULT_CALLDIFF_DEPTH, 1, 16);
+  const outputMiB = workerInteger(process.env.PLANNOTATOR_CALLDIFF_MAX_OUTPUT_MIB, DEFAULT_OUTPUT_MIB, DEFAULT_OUTPUT_MIB, 128);
+  const expandedOutput = outputMiB > DEFAULT_OUTPUT_MIB;
+  const profiling = expandedOutput || maxDepth !== DEFAULT_CALLDIFF_DEPTH;
   const request = JSON.stringify({
     packageEntry: runtime.packageEntry,
     version: runtime.version,
     cwd: plan.cwd,
     from: plan.from,
     to: plan.to,
-    maxDepth: 10,
+    maxDepth,
     paths,
     grammars: grammarChecksForLanguages(runtime, languageIds),
   });
   const npmBlocker = await createNpmBlocker();
+  const started = performance.now();
   let result: CommandResult;
   try {
     result = await runCommand(runtime.nodePath, [
@@ -1116,9 +1256,13 @@ async function executeWorker(
       cwd: runtime.runtimeDir,
       input: request,
       timeoutMs: WORKER_TIMEOUT_MS,
+      maxOutputBytes: outputMiB * 1024 * 1024,
       signal,
       env: {
         ...process.env,
+        // CallDiff runs git itself; keep a user's `color.diff = always` from
+        // wrapping its diff in ANSI escapes (#1661).
+        ...gitColorFreeEnvironment(process.env),
         PATH: `${npmBlocker.path}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
         CALLDIFF_GRAMMAR_CACHE: runtime.grammarCacheDir,
         npm_config_offline: "true",
@@ -1130,14 +1274,33 @@ async function executeWorker(
   } finally {
     npmBlocker.cleanup();
   }
+  if (profiling) console.error("[CallDiff] worker", JSON.stringify({
+    maxDepth,
+    outputMiB,
+    elapsedMs: Math.round(performance.now() - started),
+    files: paths.length,
+    stdoutBytes: result.stdoutBytes,
+    stderrBytes: result.stderrBytes,
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    outputLimitExceeded: result.outputLimitExceeded,
+    aborted: result.aborted,
+  }));
   if (result.aborted) throw new Error("Call-flow analysis was superseded by a newer review snapshot.");
   if (result.timedOut) throw new Error("CallDiff exceeded the 45 second analysis limit.");
-  if (result.outputLimitExceeded) throw new Error("CallDiff result exceeded Plannotator's 12 MB output limit.");
+  if (result.outputLimitExceeded) throw new Error(`CallDiff result exceeded Plannotator's ${outputMiB} MiB output limit.`);
   let parsed: unknown;
   try {
     parsed = JSON.parse(result.stdout);
   } catch {
     throw new Error((result.stderr.trim() || "CallDiff worker returned invalid JSON.").slice(0, 2_000));
+  }
+  if (profiling) {
+    const payload = (parsed as { result?: { ascii?: unknown; trees?: unknown } } | null)?.result;
+    console.error("[CallDiff] payload", JSON.stringify({
+      rawBytes: typeof payload?.ascii === "string" ? Buffer.byteLength(payload.ascii) : undefined,
+      trees: Array.isArray(payload?.trees) ? payload.trees.length : undefined,
+    }));
   }
   if (
     typeof parsed === "object"
@@ -1148,7 +1311,7 @@ async function executeWorker(
     const message = (parsed as Record<string, unknown>).message;
     throw new CallFlowMissingGrammarError(typeof message === "string" ? message : "Call flow language support is not installed.");
   }
-  return parseCallDiffWorkerResult(parsed);
+  return parseCallDiffWorkerResult(parsed, expandedOutput ? { maxRawLength: 16 * 1024 * 1024, maxNodes: 250_000 } : undefined);
 }
 
 async function gitRaw(cwd: string, args: readonly string[]): Promise<string> {

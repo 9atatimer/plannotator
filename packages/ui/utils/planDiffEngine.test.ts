@@ -37,6 +37,65 @@ describe("computePlanDiff — block-level behavior", () => {
     expect(mods[0].content).toContain("new");
     expect(stats.modifications).toBe(1);
   });
+
+  test("line endings alone are no change, and do not mask a real one", () => {
+    const lf = "# Plan\n\nStep one.\n\nStep two.\n";
+    const crlf = lf.replace(/\n/g, "\r\n");
+    const cr = lf.replace(/\n/g, "\r");
+
+    for (const [oldText, newText] of [
+      [crlf, lf],
+      [lf, crlf],
+      [cr, lf],
+    ] as const) {
+      const { blocks, stats } = computePlanDiff(oldText, newText);
+      expect(stats).toEqual({ additions: 0, deletions: 0, modifications: 0 });
+      expect(blocks.map((b) => b.type)).toEqual(["unchanged"]);
+    }
+
+    const edited = computePlanDiff(crlf, lf.replace("Step two.", "Step 2."));
+    expect(edited.stats).toEqual({ additions: 1, deletions: 1, modifications: 1 });
+    const mods = edited.blocks.filter((b) => b.type === "modified");
+    expect(mods).toHaveLength(1);
+    expect(mods[0].oldContent).toContain("Step two.");
+    expect(mods[0].content).toContain("Step 2.");
+  });
+});
+
+describe("computePlanDiff — a quote holding a code fence diffs as one unit", () => {
+  // Each diff chunk renders as its own quote. Line-level diffing split an
+  // edit inside a quoted fence into chunks holding half a fence each, so one
+  // chunk opened a fence it never closed and rendered the prose after it as
+  // code.
+  const OLD = "# Plan\n\n> Steps:\n>\n> ```\n> step one\n> step two\n> ```\n>\n> Done.\n\nAfter.\n";
+  const NEW = OLD.replace("step two", "step 2");
+  const fenceLines = (text: string) => text.split("\n").filter((line) => /^\s*(>\s?)+`{3,}/.test(line)).length;
+
+  test("the edit is one modified quote, both sides whole", () => {
+    const { blocks } = computePlanDiff(OLD, NEW);
+    const changed = blocks.filter((b) => b.type !== "unchanged");
+    expect(changed).toHaveLength(1);
+    expect(changed[0].type).toBe("modified");
+    for (const side of [changed[0].oldContent!, changed[0].content]) {
+      const parsed = parseMarkdownToBlocks(side, { frontmatter: false });
+      expect(parsed.map((b) => b.type)).toEqual(["blockquote"]);
+      const inner = parseMarkdownToBlocks(parsed[0].content, { frontmatter: false });
+      expect(inner.map((b) => b.type)).toEqual(["paragraph", "code", "paragraph"]);
+    }
+  });
+
+  test("no chunk holds an unclosed quoted fence", () => {
+    const { blocks } = computePlanDiff(OLD, NEW);
+    for (const block of blocks) {
+      expect(fenceLines(block.content) % 2).toBe(0);
+      if (block.oldContent) expect(fenceLines(block.oldContent) % 2).toBe(0);
+    }
+  });
+
+  test("a quote without a fence still diffs line by line", () => {
+    const { blocks } = computePlanDiff("> one\n> two\n> three\n", "> one\n> 2\n> three\n");
+    expect(blocks.map((b) => b.type)).toEqual(["unchanged", "modified", "unchanged"]);
+  });
 });
 
 describe("computeInlineDiff — qualification gate", () => {

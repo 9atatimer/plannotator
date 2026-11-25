@@ -14,6 +14,9 @@
  * costs no additional bytes.
  */
 
+import { customSyntaxThemeFor } from './customSyntaxThemes';
+import { FENCE_SYNTAX_THEME } from './fenceSyntaxThemes';
+
 /** Plannotator theme id -> Shiki theme name, per mode. `null` = this palette
  *  has no counterpart in that mode and falls back to the Pierre default. */
 export const SHIKI_THEME_MAP: Record<string, { dark: string | null; light: string | null }> = {
@@ -41,6 +44,8 @@ export const SHIKI_THEME_MAP: Record<string, { dark: string | null; light: strin
   'nord': { dark: 'nord', light: null },
   'one-dark-pro': { dark: 'one-dark-pro', light: null },
   'one-light': { dark: null, light: 'one-light' },
+  // Dark is the PaulMillr palette (themes/plannotator-modern.css), which has no Shiki counterpart: the Pierre default, as PaulMillr.
+  'plannotator-modern': { dark: null, light: 'github-light-high-contrast' },
   'plastic': { dark: 'plastic', light: null },
   'poimandres': { dark: 'poimandres', light: null },
   'red': { dark: 'red', light: null },
@@ -50,6 +55,8 @@ export const SHIKI_THEME_MAP: Record<string, { dark: string | null; light: strin
   'solarized': { dark: 'solarized-dark', light: 'solarized-light' },
   'synthwave-84': { dark: 'synthwave-84', light: null },
   'tokyo-night': { dark: 'tokyo-night', light: null },
+  'tokyo-night-moon': { dark: 'tokyo-night', light: null },
+  'tritanopia': { dark: 'pierre-dark-tritanopia', light: 'pierre-light-tritanopia' },
   'vesper': { dark: 'vesper', light: null },
   'vitesse': { dark: 'vitesse-dark', light: 'vitesse-light' },
   'vitesse-black': { dark: 'vitesse-black', light: null },
@@ -68,16 +75,64 @@ export const DEFAULT_SYNTAX_THEME = { dark: 'pierre-dark', light: 'pierre-light'
  * customised it.
  */
 export function resolveSyntaxTheme(colorTheme: string, mode: 'dark' | 'light'): { dark: string; light: string } | undefined {
+  // A custom theme's own code colours (customSyntaxThemes.ts), per half; a half without them, Pierre's default.
+  const custom = customSyntaxThemeFor(colorTheme, mode);
+  if (custom) {
+    return {
+      dark: customSyntaxThemeFor(colorTheme, 'dark') ?? DEFAULT_SYNTAX_THEME.dark,
+      light: customSyntaxThemeFor(colorTheme, 'light') ?? DEFAULT_SYNTAX_THEME.light,
+    };
+  }
   const map = SHIKI_THEME_MAP[colorTheme];
   if (!map || !map[mode]) return undefined;
   return { dark: map.dark || DEFAULT_SYNTAX_THEME.dark, light: map.light || DEFAULT_SYNTAX_THEME.light };
 }
 
 /**
+ * Host override for the fence theme (`configurePlannotatorUI({ fenceTheme })`).
+ * Return a Shiki theme name to use it, or `undefined` to fall through to the
+ * default resolution below. A name Shiki does not know renders the block as
+ * plain text, exactly like an unknown fence language.
+ */
+export type FenceThemeResolver = (colorTheme: string, mode: 'light' | 'dark') => string | undefined;
+
+let fenceThemeResolver: FenceThemeResolver | null = null;
+
+/** Install (or with `null`, remove) the host's fence theme override. */
+export function setFenceThemeResolver(resolver: FenceThemeResolver | null): void {
+  fenceThemeResolver = resolver;
+}
+
+export function resetFenceThemeResolver(): void {
+  fenceThemeResolver = null;
+}
+
+/**
  * The single concrete Shiki theme name for the palette currently on screen.
  * Markdown fences render one mode at a time, so unlike the diff pane (which
  * hands Pierre a dark/light pair and lets CSS pick) they want a resolved name.
+ *
+ * Every fence-style consumer resolves through here (`useFenceTheme`: Viewer
+ * fences, `CodeBlock`, the code-file hover preview, the plan diff view, code
+ * review's suggestion snippets), so a host override applies to all of them.
+ * The diff pane's dark/light pair (`resolveSyntaxTheme`) is not affected.
+ *
+ * Where that pair would be Pierre's default (`pierre-light` / `pierre-dark`),
+ * a fence gets `FENCE_SYNTAX_THEME`: the same colours with every one under
+ * 4.5:1 on a code block fixed (fenceSyntaxThemes.ts).
  */
 export function resolveFenceTheme(colorTheme: string, mode: 'dark' | 'light'): string {
-  return resolveSyntaxTheme(colorTheme, mode)?.[mode] ?? DEFAULT_SYNTAX_THEME[mode];
+  if (fenceThemeResolver) {
+    let override: string | undefined;
+    try {
+      override = fenceThemeResolver(colorTheme, mode);
+    } catch {
+      override = undefined; // a throwing host resolver must not break rendering
+    }
+    if (typeof override === 'string' && override) return override;
+  }
+  const resolved = resolveSyntaxTheme(colorTheme, mode)?.[mode] ?? DEFAULT_SYNTAX_THEME[mode];
+  // Where the diff pane would draw Pierre's default, a fence draws the same
+  // colours with the low-contrast ones fixed (fenceSyntaxThemes.ts).
+  return resolved === DEFAULT_SYNTAX_THEME[mode] ? FENCE_SYNTAX_THEME[mode] : resolved;
 }

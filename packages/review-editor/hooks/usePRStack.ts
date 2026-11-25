@@ -1,6 +1,5 @@
 import { useState, useCallback, type RefObject } from 'react';
 import type { PRDiffScope } from '@plannotator/shared/pr-stack';
-import type { SemanticDiffAdvert } from '@plannotator/shared/semantic-diff-types';
 
 export interface PRSwitchResponse {
   rawPatch: string;
@@ -16,13 +15,13 @@ export interface PRSwitchResponse {
   repoInfo?: unknown;
   viewedFiles?: string[];
   error?: string;
-  semanticDiff?: SemanticDiffAdvert;
   approvalNotesSupported?: boolean;
 }
 
 export interface PRStackCallbacks {
   applyPRResponse: (data: PRSwitchResponse) => void;
   onError: (message: string) => void;
+  beforeSwitch?: () => Promise<void>;
 }
 
 export function usePRStack(callbacksRef: RefObject<PRStackCallbacks | null>) {
@@ -34,6 +33,7 @@ export function usePRStack(callbacksRef: RefObject<PRStackCallbacks | null>) {
     if (!cb) return;
     setIsSwitchingPRScope(true);
     try {
+      await cb.beforeSwitch?.();
       const res = await fetch('/api/pr-diff-scope', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -60,6 +60,7 @@ export function usePRStack(callbacksRef: RefObject<PRStackCallbacks | null>) {
     if (!cb) return;
     setIsLoadingFullDiff(true);
     try {
+      await cb.beforeSwitch?.();
       const res = await fetch('/api/pr-diff-scope', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -82,6 +83,7 @@ export function usePRStack(callbacksRef: RefObject<PRStackCallbacks | null>) {
     if (!cb) return;
     setIsSwitchingPRScope(true);
     try {
+      await cb.beforeSwitch?.();
       const res = await fetch('/api/pr-switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

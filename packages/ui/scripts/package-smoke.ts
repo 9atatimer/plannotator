@@ -249,11 +249,17 @@ try {
   const requiredEntries = [
     "components/AnnotationToolstrip.tsx",
     "components/StickyHeaderLane.tsx",
+    "components/DiffFileTree.tsx",
+    "utils/diffFileTree.ts",
     "components/html-viewer/bridge-script.asset.js",
     "components/html-viewer/bridge-script.lite.ts",
     "configure.ts",
     "HANDOFF.md",
     "styles.css",
+    "contents-rail.css",
+    "inbox-thread.css",
+    "components/frame/index.ts",
+    "components/frame/frame.css",
     "types.ts",
   ];
   for (const entry of requiredEntries) {
@@ -311,8 +317,12 @@ try {
   writeFileSync(
     join(consumerDir, "consumer.tsx"),
     [
+      'import "@plannotator/ui/inbox-thread.css";',
+      'import "@plannotator/ui/frame.css";',
+      'import { FrameGround, DocumentRailShell } from "@plannotator/ui/components/frame";',
       'import { AnnotationPanel } from "@plannotator/ui/components/AnnotationPanel";',
       'import { StickyHeaderLane, type StickyHeaderLaneProps } from "@plannotator/ui/components/StickyHeaderLane";',
+      'import { DiffFileTree, type DiffFileTreeProps } from "@plannotator/ui/components/DiffFileTree";',
       'import { Viewer, type ViewerAnnotationHeaderConfig } from "@plannotator/ui/components/Viewer";',
       'import * as parser from "@plannotator/ui/utils/parser";',
       'import { configurePlannotatorUI } from "@plannotator/ui/configure";',
@@ -321,6 +331,9 @@ try {
       'const laneProps: Pick<StickyHeaderLaneProps, "visibility" | "sticky"> = { visibility: "always", sticky: false };',
       'const annotationHeader: ViewerAnnotationHeaderConfig = { onInputMethodChange: () => {}, onModeChange: () => {}, hideQuickLabel: true };',
       "void StickyHeaderLane;",
+      'const treeProps: DiffFileTreeProps = { files: [{ path: "a.ts", status: "modified", additions: 1, deletions: 0 }], selectedPath: null, onSelect: () => {} };',
+      "void DiffFileTree;",
+      "void treeProps;",
       "void laneProps;",
       "void Viewer;",
       "void annotationHeader;",
@@ -328,6 +341,8 @@ try {
       "void parser;",
       "configurePlannotatorUI({});",
       "void config;",
+      "void FrameGround;",
+      "void DocumentRailShell;",
       "",
     ].join("\n"),
   );
@@ -396,7 +411,7 @@ try {
   );
 
   console.log(
-    `Verified @plannotator/ui@${expectedUiVersion} packs, resolves AnnotationPanel/Viewer/StickyHeaderLane/parser, and installs externally with @plannotator/core@${expectedCoreVersion}.`,
+    `Verified @plannotator/ui@${expectedUiVersion} packs, resolves AnnotationPanel/Viewer/StickyHeaderLane/DiffFileTree/parser/inbox-thread.css/components/frame/frame.css, and installs externally with @plannotator/core@${expectedCoreVersion}.`,
   );
 } finally {
   rmSync(workDir, { recursive: true, force: true });

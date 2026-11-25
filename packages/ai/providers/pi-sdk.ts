@@ -9,6 +9,12 @@
 
 import { BaseSession } from "../base-session.ts";
 import { buildEffectivePrompt, buildSystemPrompt } from "../context.ts";
+import {
+	piCatalogFromRpc,
+	piThinkingLevelsSupported,
+	type CatalogModel,
+	type PiRpcModel,
+} from "@plannotator/core/model-catalog";
 import type {
 	AIMessage,
 	AIProvider,
@@ -21,6 +27,8 @@ import {
 	killWindowsProcessTree,
 	resolveWindowsCommandShim,
 } from "./command-path.ts";
+import { createPiVersionProbe } from "./pi-version.ts";
+import { askAiChildEnv } from "./ask-ai-env.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -48,13 +56,13 @@ class PiProcess {
 	private buffer = "";
 	private _alive = false;
 
-	async spawn(piPath: string, cwd: string): Promise<void> {
+	async spawn(piPath: string, cwd: string, extraArgs: readonly string[] = []): Promise<void> {
 		const commandPath = resolveWindowsCommandShim(piPath);
+		const args = ["--mode", "rpc", ...extraArgs];
 		const command =
-			buildWindowsCommandScriptSpawnCommand(commandPath, ["--mode", "rpc"]) ?? [
+			buildWindowsCommandScriptSpawnCommand(commandPath, args) ?? [
 				commandPath,
-				"--mode",
-				"rpc",
+				...args,
 			];
 		try {
 			// stderr is "ignore", not "pipe": we never read it, and an
@@ -62,9 +70,17 @@ class PiProcess {
 			// (same reasoning as codex-app-server.ts).
 			this.proc = Bun.spawn(command, {
 				cwd,
+				// The LIVE env, never Bun's startup env (which still holds the
+				// variables the CLI scrubbed, like the bridge token): see
+				// packages/shared/child-env.ts. Plannotator's integration off
+				// (ask-ai-env.ts): Pi's RPC mode reports `ctx.hasUI`, so the
+				// Plannotator Pi extension would otherwise take this throwaway
+				// process for a person's session and connect it to the Inbox.
+				env: askAiChildEnv(),
 				stdin: "pipe",
 				stdout: "pipe",
 				stderr: "ignore",
+				windowsHide: true,
 			});
 		} catch (err) {
 			const error = err instanceof Error ? err : new Error(String(err));
@@ -253,10 +269,16 @@ export class PiSDKProvider implements AIProvider {
 		streaming: true,
 		tools: true,
 	};
-	models?: Array<{ id: string; label: string; default?: boolean }>;
+	models?: CatalogModel[];
 
 	private config: PiSDKConfig;
 	private sessions = new Map<string, PiSDKSession>();
+	private versionProbe = createPiVersionProbe(() => this.config.piExecutablePath ?? "pi");
+
+	/** The installed pi's version, once `pi --version` has answered. */
+	get toolVersion(): string | undefined {
+		return this.versionProbe.version;
+	}
 
 	constructor(config: PiSDKConfig) {
 		this.config = config;
@@ -264,11 +286,14 @@ export class PiSDKProvider implements AIProvider {
 
 	async createSession(options: CreateSessionOptions): Promise<PiSDKSession> {
 		const session = new PiSDKSession({
-			systemPrompt: buildSystemPrompt(options.context),
+			systemPrompt: options.oneShot?.systemPrompt ?? buildSystemPrompt(options.context),
 			cwd: options.cwd ?? this.config.cwd ?? process.cwd(),
 			parentSessionId: null,
 			piExecutablePath: this.config.piExecutablePath ?? "pi",
 			model: options.model ?? this.config.model,
+			reasoningEffort: options.reasoningEffort,
+			oneShot: !!options.oneShot,
+			thinkingLevelsSupported: async () => piThinkingLevelsSupported(await this.versionProbe.ensure()),
 		});
 		this.sessions.set(session.id, session);
 		return session;
@@ -285,21 +310,29 @@ export class PiSDKProvider implements AIProvider {
 		throw new Error("Pi does not support session resuming.");
 	}
 
+	/** The process reading the models, for `dispose`. */
+	private discovery: PiProcess | undefined;
+
 	dispose(): void {
 		for (const session of this.sessions.values()) {
 			session.killProcess();
 		}
 		this.sessions.clear();
+		this.discovery?.kill();
 	}
 
 	/** Fetch available models from Pi. Call before registering the provider. */
 	async fetchModels(): Promise<void> {
 		const piPath = this.config.piExecutablePath ?? "pi";
+		// `pi --version` runs alongside discovery; it decides whether thinking
+		// levels are offered (see piThinkingLevelsSupported).
+		const versionProbe = this.versionProbe.ensure();
 
 		let proc: PiProcess | undefined;
 
 		try {
 			proc = new PiProcess();
+			this.discovery = proc;
 			await proc.spawn(piPath, this.config.cwd ?? process.cwd());
 
 			const data = await Promise.race([
@@ -309,17 +342,12 @@ export class PiSDKProvider implements AIProvider {
 				),
 			]);
 
-			const rawModels = (
-				data as {
-					models?: Array<{ provider: string; id: string; name?: string }>;
-				}
-			).models;
-			if (rawModels && rawModels.length > 0) {
-				this.models = rawModels.map((m, i) => ({
-					id: `${m.provider}/${m.id}`,
-					label: m.name ?? m.id,
-					...(i === 0 && { default: true }),
-				}));
+			const rawModels = (data as { models?: PiRpcModel[] }).models;
+			if (Array.isArray(rawModels) && rawModels.length > 0) {
+				// Levels are offered only once the version says pi takes them
+				// session-scoped; the probe ran alongside get_available_models.
+				const models = piCatalogFromRpc(rawModels, await versionProbe);
+				if (models.length > 0) this.models = models;
 			}
 		} catch {
 			// Pi not configured or no models available
@@ -340,6 +368,31 @@ interface SessionConfig {
 	piExecutablePath: string;
 	/** Model in "provider/modelId" format, e.g. "anthropic/claude-haiku-4-5". */
 	model?: string;
+	/**
+	 * A thinking level the selected model lists (`piSupportedThinkingLevels`).
+	 * Unset means Auto: nothing is sent and pi keeps the user's default.
+	 */
+	reasoningEffort?: string;
+	/** Whether the installed pi takes `set_thinking_level` session-scoped. */
+	thinkingLevelsSupported: () => Promise<boolean>;
+	/** A single judgment (`CreateSessionOptions.oneShot`). */
+	oneShot?: boolean;
+}
+
+/**
+ * Pi's arguments for a single judgment: no tools, no saved session, and none of
+ * the person's extensions, skills or context files, which would load on every
+ * PR. The model and thinking level go here too, not over RPC: before pi 0.84.3
+ * RPC `set_model` rewrote the person's default model, which a background run
+ * must never do. Low thinking unless told otherwise: Pi lowers it further for a
+ * model that can't do it.
+ */
+export function piOneShotArgs(model: string | undefined, level: string | undefined): string[] {
+	const args = ["--no-tools", "--no-session", "--no-extensions", "--no-skills", "--no-context-files"];
+	const [provider, ...rest] = (model ?? "").split("/");
+	if (provider && rest.length > 0) args.push("--provider", provider, "--model", rest.join("/"));
+	args.push("--thinking", level ?? "low");
+	return args;
 }
 
 class PiSDKSession extends BaseSession {
@@ -362,11 +415,25 @@ class PiSDKSession extends BaseSession {
 		try {
 			// Lazy-spawn subprocess
 			if (!this.process || !this.process.alive) {
+				// The version check runs alongside the spawn, and only when a
+				// level was picked.
+				const oneShot = this.config.oneShot === true;
+				const levelAllowed = this.config.reasoningEffort && !oneShot
+					? this.config.thinkingLevelsSupported().catch(() => false)
+					: Promise.resolve(false);
 				this.process = new PiProcess();
-				await this.process.spawn(this.config.piExecutablePath, this.config.cwd);
+				await this.process.spawn(
+					this.config.piExecutablePath,
+					this.config.cwd,
+					oneShot ? piOneShotArgs(this.config.model, this.config.reasoningEffort) : [],
+				);
 
-				// Set model if specified (format: "provider/modelId")
-				if (this.config.model) {
+				// Set model if specified (format: "provider/modelId").
+				// Note: before pi 0.84.3 RPC `set_model` also rewrote the user's
+				// global default model (the same bug as `set_thinking_level`,
+				// below). It is left as is here: picking a model is the
+				// provider's core job, and that gate is a separate decision.
+				if (this.config.model && !oneShot) {
 					const [provider, ...rest] = this.config.model.split("/");
 					const modelId = rest.join("/");
 					if (provider && modelId) {
@@ -379,6 +446,22 @@ class PiSDKSession extends BaseSession {
 						} catch {
 							// Continue with Pi's default model
 						}
+					}
+				}
+
+				// Set the thinking level after the model: the levels a model
+				// accepts depend on which model is selected. Only on a pi that
+				// keeps it session-scoped (>= 0.84.3): older pi wrote it to the
+				// user's global settings, so there the level is not offered
+				// and, should one arrive anyway, not sent.
+				if (this.config.reasoningEffort && (await levelAllowed)) {
+					try {
+						await this.process.sendAndWait({
+							type: "set_thinking_level",
+							level: this.config.reasoningEffort,
+						});
+					} catch {
+						// Continue with Pi's own default thinking level
 					}
 				}
 

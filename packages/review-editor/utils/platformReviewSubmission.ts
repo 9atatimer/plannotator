@@ -1,3 +1,5 @@
+import { SERVER_SESSION_MISMATCH_CODE } from '@plannotator/shared/server-session';
+import { markServerSessionReplaced, withServerSession } from '@plannotator/ui/utils/serverSession';
 import type { PRReviewAction } from '@plannotator/shared/pr-types';
 import type { SubmissionTarget } from '../components/ReviewSubmissionDialog';
 import { buildPRActionRequest } from '../components/ReviewSubmissionDialog';
@@ -20,6 +22,8 @@ export type PlatformReviewFetch = (
 export interface PlatformReviewTargetResult {
   target: SubmissionTarget;
   prUrl?: string;
+  /** The decision went as a plain comment (a GitLab without request changes). */
+  postedAs?: 'comment';
 }
 
 /** Result of one complete multi-target platform submission attempt. */
@@ -28,6 +32,8 @@ export interface PlatformReviewAttemptResult {
   allComplete: boolean;
   recovery: ReviewSubmissionRecovery | null;
   openUrls: string[];
+  /** Some target's decision went as a plain comment: the confirmation says so, not the button pressed. */
+  postedAs?: 'comment';
 }
 
 /**
@@ -72,7 +78,8 @@ export async function submitPlatformReviewTarget(options: {
     response = await fetchReview('/api/pr-action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildPRActionRequest(action, body, target)),
+      // The stale-tab guard: a server that took over this port refuses it.
+      body: JSON.stringify(withServerSession(buildPRActionRequest(action, body, target))),
     });
   } catch {
     return { target: markPlatformReviewAmbiguous(target) };
@@ -90,6 +97,10 @@ export async function submitPlatformReviewTarget(options: {
   }
 
   if (!response.ok) {
+    // Nothing was posted: this tab's server was replaced. Show the reload prompt.
+    if (response.status === 409 && (rawResponse as { code?: unknown } | null)?.code === SERVER_SESSION_MISMATCH_CODE) {
+      markServerSessionReplaced();
+    }
     return {
       target: markPlatformReviewSafeFailure(
         target,
@@ -113,6 +124,8 @@ export async function submitPlatformReviewTarget(options: {
       ...(parsed.prUrl ? { prUrl: parsed.prUrl } : {}),
     };
   }
+  // A retry after a partial post completes what that post began, as it went.
+  const postedAs = parsed.submission.postedAs ?? target.partial?.postedAs;
   return {
     target: {
       ...target,
@@ -121,6 +134,7 @@ export async function submitPlatformReviewTarget(options: {
       partial: undefined,
     },
     ...(parsed.prUrl ? { prUrl: parsed.prUrl } : {}),
+    ...(postedAs ? { postedAs } : {}),
   };
 }
 
@@ -151,11 +165,13 @@ export async function submitPlatformReviewTargets(options: {
     })),
   );
   const openUrls: string[] = [];
+  let postedAs: 'comment' | undefined;
   const updatedTargets = results.map((result, index) => {
     if (result.status === 'rejected') {
       return markPlatformReviewAmbiguous(targets[index]);
     }
     if (result.value.prUrl) openUrls.push(result.value.prUrl);
+    if (result.value.postedAs) postedAs = result.value.postedAs;
     return result.value.target;
   });
   const allComplete = updatedTargets.every((target) => target.status === 'success');
@@ -166,5 +182,6 @@ export async function submitPlatformReviewTargets(options: {
       ? null
       : buildReviewSubmissionRecovery(action, generalComment, updatedTargets),
     openUrls,
+    ...(postedAs ? { postedAs } : {}),
   };
 }

@@ -44,11 +44,11 @@ const runtime: CallFlowRuntime = {
   grammarCacheDir: "/runtime/grammar-cache",
   installedLanguageIds: ["javascript-typescript"],
   managed: true,
-  version: "0.4.1",
+  version: CALLDIFF_VERSION,
 };
 
 const parsedResult: ParsedCallDiffWorkerResult = {
-  version: "0.4.1",
+  version: CALLDIFF_VERSION,
   from: "before",
   to: "after",
   raw: "",
@@ -408,7 +408,7 @@ describe("CallFlowService", () => {
       resolveRuntime: async () => ({
         ok: false,
         reason: "node-unavailable",
-        message: "Call flow requires Node.js 22 or newer, which was not found on PATH.",
+        message: "Call flow needs Node.js 22.18 or newer, which was not found on PATH.",
       }),
     });
     const rawPatch = [
@@ -594,7 +594,7 @@ describe("CallFlowService", () => {
     const runtimeDir = join(repo, "fake-runtime");
     const packageRoot = join(runtimeDir, "node_modules", "calldiff");
     mkdirSync(join(packageRoot, "dist"), { recursive: true });
-    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ type: "module", version: "0.4.1" }));
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ type: "module", version: CALLDIFF_VERSION }));
     writeFileSync(join(packageRoot, "dist", "run.js"), [
       'import { execFileSync } from "node:child_process";',
       'export function runDiff() { execFileSync("npm", ["--version"]); return {}; }',
@@ -611,12 +611,55 @@ describe("CallFlowService", () => {
       grammarCacheDir: join(runtimeDir, "grammar-cache"),
       installedLanguageIds: ["javascript-typescript"],
       managed: true,
-      version: "0.4.1",
+      version: CALLDIFF_VERSION,
     };
     const service = new CallFlowService({ resolveRuntime: async () => ({ ok: true, runtime: fakeRuntime }) });
     const result = await service.analyze({ ...input(), rawPatch });
     expect(result.status).toBe("error");
     if (result.status === "error") expect(result.message).toContain("package installation is disabled during analysis");
+  });
+
+  test("applies bounded depth and output overrides to the worker", async () => {
+    writeFileSync(join(repo, "main.ts"), "export function main() { return 2; }\n");
+    const rawPatch = run(["diff", "--binary", "--full-index"]);
+    const runtimeDir = join(repo, "fake-runtime");
+    mkdirSync(runtimeDir);
+    const packageEntry = join(runtimeDir, "call-diff.mjs");
+    writeFileSync(join(runtimeDir, "package.json"), JSON.stringify({ version: CALLDIFF_VERSION }));
+    for (const [name, version] of [["tree-sitter", "0.25.1"], ["tree-sitter-javascript", "0.25.0"], ["tree-sitter-typescript", "0.23.2"]]) {
+      const grammarRoot = join(runtimeDir, "node_modules", name);
+      mkdirSync(grammarRoot, { recursive: true });
+      writeFileSync(join(grammarRoot, "package.json"), JSON.stringify({ version }));
+    }
+    writeFileSync(packageEntry, `
+      export function runDiff({ maxDepth }) {
+        const message = "Depth " + maxDepth;
+        return { from: "before", to: "after", trees: [], message, ascii: "x".repeat(13 * 1024 * 1024) };
+      }
+    `);
+    const fakeRuntime = { ...runtime, nodePath: process.execPath, packageEntry, runtimeDir, managed: false };
+    const runAnalysis = () => new CallFlowService({
+      resolveRuntime: async () => ({ ok: true, runtime: fakeRuntime }),
+    }).analyze({ ...input(), rawPatch });
+    const previousDepth = process.env.PLANNOTATOR_CALLDIFF_MAX_DEPTH;
+    const previousOutput = process.env.PLANNOTATOR_CALLDIFF_MAX_OUTPUT_MIB;
+    try {
+      process.env.PLANNOTATOR_CALLDIFF_MAX_DEPTH = "6";
+      process.env.PLANNOTATOR_CALLDIFF_MAX_OUTPUT_MIB = "129";
+      const limited = await runAnalysis();
+      expect(limited).toMatchObject({ status: "error", message: expect.stringContaining("12 MiB output limit") });
+
+      process.env.PLANNOTATOR_CALLDIFF_MAX_OUTPUT_MIB = "16";
+      expect(await runAnalysis()).toMatchObject({ status: "ok", message: "Depth 6" });
+
+      process.env.PLANNOTATOR_CALLDIFF_MAX_DEPTH = "16.5";
+      expect(await runAnalysis()).toMatchObject({ status: "ok", message: "Depth 10" });
+    } finally {
+      if (previousDepth === undefined) delete process.env.PLANNOTATOR_CALLDIFF_MAX_DEPTH;
+      else process.env.PLANNOTATOR_CALLDIFF_MAX_DEPTH = previousDepth;
+      if (previousOutput === undefined) delete process.env.PLANNOTATOR_CALLDIFF_MAX_OUTPUT_MIB;
+      else process.env.PLANNOTATOR_CALLDIFF_MAX_OUTPUT_MIB = previousOutput;
+    }
   });
 
   test("a worker-side grammar race becomes a missing-grammar state", async () => {
@@ -628,7 +671,7 @@ describe("CallFlowService", () => {
     const runtimeDir = join(repo, "missing-runtime");
     const packageRoot = join(runtimeDir, "node_modules", "calldiff");
     mkdirSync(join(packageRoot, "dist"), { recursive: true });
-    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ type: "module", version: "0.4.1" }));
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ type: "module", version: CALLDIFF_VERSION }));
     writeFileSync(join(packageRoot, "dist", "run.js"), "export function runDiff() { throw new Error('must not run'); }\n");
     const fakeRuntime: CallFlowRuntime = {
       nodePath: process.execPath,
@@ -637,7 +680,7 @@ describe("CallFlowService", () => {
       grammarCacheDir: join(runtimeDir, "grammar-cache"),
       installedLanguageIds: ["javascript-typescript", "python"],
       managed: true,
-      version: "0.4.1",
+      version: CALLDIFF_VERSION,
     };
     const service = new CallFlowService({ resolveRuntime: async () => ({ ok: true, runtime: fakeRuntime }) });
     const result = await service.analyze({ ...input(), rawPatch });

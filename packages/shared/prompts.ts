@@ -26,6 +26,8 @@ export const PLAN_TOOL_NAMES: Record<PromptRuntime, string> = {
   "gemini-cli": "exit_plan_mode",
   "oh-my-pi": "ExitPlanMode",
   "mistral-vibe": "exit_plan_mode",
+  "qwen-code": "exit_plan_mode",
+  dsh: "exit_plan_mode",
 };
 
 export function getPlanToolName(runtime?: PromptRuntime | null): string {
@@ -48,6 +50,17 @@ export const DEFAULT_REVIEW_DENIED_SUFFIX = "\n\nTreat the findings above as unv
 
 export const DEFAULT_PLAN_DENIED_PROMPT =
   "YOUR PLAN WAS NOT APPROVED.\n\nYou MUST revise the plan to address ALL of the feedback below before calling {{toolName}} again.\n\nRules:\n{{planFileRule}}- Do not resubmit the same plan unchanged.\n- Do NOT change the plan title (first # heading) unless the user explicitly asks you to.\n\n{{feedback}}";
+
+/**
+ * Sent instead of the denied prompt when the reviewer's only feedback is
+ * answers to the plan's `:::question` blocks (the client posts
+ * `answersOnly: true` on /api/deny). "Your plan was not approved" is the
+ * wrong tone for "I answered your questions"; this asks for the answers to
+ * be folded into a revised plan and teaches the resubmission convention
+ * (`- [x]` = settled) at the moment it matters.
+ */
+export const DEFAULT_PLAN_ANSWERED_PROMPT =
+  "The user answered the questions in your plan and asked for no other changes. Their answers are below.\n\nRevise the plan so each answered question becomes a decision, then call {{toolName}} again.\n\nRules:\n{{planFileRule}}- For each answered question, either remove its `:::question` block and write the decision into the plan, or keep the block and mark the chosen choice `- [x]` (a checked choice reads as settled).\n- Keep every question listed under \"Unanswered\" as it is.\n- Treat a note on an answer as guidance from the user.\n- Do NOT change the plan title (first # heading) unless the user explicitly asks you to.\n\n{{feedback}}";
 
 export const DEFAULT_PLAN_APPROVED_PROMPT =
   "Plan approved. You now have full tool access (read, bash, edit, write). Execute the plan in {{planFilePath}}. {{doneMsg}}";
@@ -72,7 +85,7 @@ export const DEFAULT_ANNOTATE_APPROVED_WITH_NOTES_PROMPT =
 // ─── Core resolver ───────────────────────────────────────────────────────────
 
 type PromptSection = "review" | "plan" | "annotate";
-type PromptKey = "approved" | "approvedWithNotes" | "autoApproved" | "denied"
+type PromptKey = "approved" | "approvedWithNotes" | "autoApproved" | "denied" | "answered"
   | "fileFeedback" | "messageFeedback";
 
 interface PromptLookupOptions {
@@ -204,6 +217,40 @@ export function getPlanDeniedPrompt(
   return resolveTemplate(template, vars ?? {});
 }
 
+export function getPlanAnsweredPrompt(
+  runtime?: PromptRuntime | null,
+  config?: PlannotatorConfig,
+  vars?: FeedbackVars,
+): string {
+  const template = getConfiguredPrompt({
+    section: "plan",
+    key: "answered",
+    runtime,
+    config,
+    fallback: DEFAULT_PLAN_ANSWERED_PROMPT,
+  });
+  return resolveTemplate(template, vars ?? {});
+}
+
+/**
+ * The message for a plan decision that did not approve. Every plan deny
+ * consumer (the Claude Code / Codex / Gemini / Copilot / Vibe hook outputs,
+ * OpenCode 1 and 2, Pi) routes through this one selector so the choice
+ * cannot fork between them: `answersOnly` (the reviewer only answered the
+ * plan's questions) selects `plan.answered`; anything else is the denied
+ * prompt, byte-identical to before.
+ */
+export function composePlanDeniedMessage(
+  runtime?: PromptRuntime | null,
+  config?: PlannotatorConfig,
+  vars?: FeedbackVars,
+  options?: { answersOnly?: boolean },
+): string {
+  return options?.answersOnly === true
+    ? getPlanAnsweredPrompt(runtime, config, vars)
+    : getPlanDeniedPrompt(runtime, config, vars);
+}
+
 const PLAN_APPROVED_RUNTIME_DEFAULTS: Partial<Record<PromptRuntime, string>> = {
   opencode: "Plan approved!{{doneMsg}}",
 };
@@ -226,6 +273,11 @@ export function getPlanApprovedPrompt(
 
 const PLAN_APPROVED_WITH_NOTES_RUNTIME_DEFAULTS: Partial<Record<PromptRuntime, string>> = {
   opencode: "Plan approved with notes!\n{{doneMsg}}\n\n## Implementation Notes\n\nThe user approved your plan but added the following notes to consider during implementation:\n\n{{feedback}}{{proceedSuffix}}",
+  // DeepSeek Harness: the notes reach the agent as a message after
+  // exit_plan_mode's own result ("Plan approved — plan mode exited"). The plan
+  // lives in that tool call, not a file, and DSH's plan mode gates no tools,
+  // so the default's plan path and "full tool access" lines do not apply.
+  dsh: "Plan approved with notes!{{doneMsg}}\n\n## Implementation Notes\n\nThe user approved your plan but added the following notes to consider during implementation:\n\n{{feedback}}\n\nProceed with implementation, incorporating these notes where applicable.",
 };
 
 export function getPlanApprovedWithNotesPrompt(

@@ -6,23 +6,58 @@
  * hover in Viewer) — no text selection, no web-highlighter.
  */
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, createContext, useContext, useMemo } from "react";
 import { parseMarkdownToBlocks, computeListIndices } from "../../utils/parser";
-import { applyHighlight, codeBlockClassName, codeBlockKeepsLayout } from "../../utils/codeHighlight";
+import { applyHighlight, codeBlockClassName, codeBlockKeepsLayout, ensureHighlight, highlightToRuns, type HighlightRun } from "../../utils/codeHighlight";
+import { chunkSegments, codeSegmentsToHtml, wordDiffSegments } from "../../utils/codeDiffSegments";
 import { useFenceTheme } from "../../hooks/useFenceTheme";
 import { ListItemBody } from "../ListItemBody";
+import { SourceLikeInlineContext } from "../InlineMarkdown";
+import { BlockquoteBlock, BLOCKQUOTE_CLASS_NAME } from "../blocks/BlockquoteBlock";
+import { parseTableContent } from "../blocks/TableBlock";
 import type { Block, Annotation, EditorMode, ImageAttachment } from "../../types";
 import { AnnotationType } from "../../types";
-import type {
-  PlanDiffBlock,
-  InlineDiffToken,
-  InlineDiffWrap,
+import {
+  computeCodeInlineDiff,
+  foldUnchangedPlanDiff,
+  type PlanDiffBlock,
+  type PlanDiffFold,
+  type InlineDiffToken,
+  type InlineDiffWrap,
 } from "../../utils/planDiffEngine";
 import type { QuickLabel } from "../../utils/quickLabels";
 import { AnnotationToolbar } from "../AnnotationToolbar";
 import { CommentPopover } from "../CommentPopover";
 import { FloatingQuickLabelPicker } from "../FloatingQuickLabelPicker";
 import { getIdentity } from "../../utils/identity";
+import { UNAVAILABLE_IMAGE_CLASS, useImageResolver } from "../ImageResolverContext";
+import { useLocalLinkMatch, useLocalLinkResolver } from "../LocalLinkContext";
+import { useHighlightCopy } from "../../utils/highlightCopy";
+
+/**
+ * Which version a rendered chunk comes from: 'old' for a removed block and
+ * the old half of a modified block, 'new' for everything else.
+ */
+export type PlanDiffSide = "old" | "new";
+
+/** Host renderer for one parsed markdown block (see `renderBlock`). */
+export type PlanDiffBlockRenderer = (
+  block: Block,
+  orderedIndex: number | null,
+  side: PlanDiffSide,
+) => React.ReactNode;
+
+/** Provided only when a host passes `renderBlock`; absent, chunks render as always. */
+const RenderBlockContext = createContext<PlanDiffBlockRenderer | null>(null);
+
+/** A config or data file diffed as its own text: see `codeDocument`. */
+export interface PlanDiffCodeDocument {
+  /** Shiki grammar for the chunks, or undefined for plain monospace text. */
+  language?: string;
+}
+
+/** Provided only when a host passes `codeDocument`; absent, chunks parse as markdown. */
+const CodeDocumentContext = createContext<PlanDiffCodeDocument | null>(null);
 
 interface PlanCleanDiffViewProps {
   blocks: PlanDiffBlock[];
@@ -38,16 +73,70 @@ interface PlanCleanDiffViewProps {
    * "Classic" diff view exposed in the mode switcher.
    */
   wordLevel?: boolean;
+  /**
+   * Optional: render each parsed markdown block (headings, paragraphs, code,
+   * tables, …) with the host's renderer instead of the view's built-in
+   * simple one. Not used for inline word-level modified blocks. Absent, the
+   * view renders exactly as before.
+   */
+  renderBlock?: PlanDiffBlockRenderer;
+  /**
+   * Optional: a left gutter on every block naming its source lines
+   * ("11–12", "old 15–16"; a modified block shows both). Needs the line
+   * ranges `computePlanDiff` fills. Absent, no gutter.
+   */
+  lineGutter?: boolean;
+  /**
+   * Optional: fold long runs of unchanged sections behind a "N unchanged
+   * sections" row that expands in place (see `foldUnchangedPlanDiff`).
+   */
+  foldUnchanged?: boolean;
+  /**
+   * Optional: classes for unchanged blocks, replacing the default dimming
+   * (`opacity-60 hover:opacity-100 transition-opacity`).
+   */
+  unchangedClassName?: string;
+  /**
+   * Optional: the document is a config or data file (`renderAs: "code"`).
+   * Every chunk renders as its own monospace text in `language` instead of
+   * being parsed as markdown, so a `#` comment stays a comment, and a
+   * modified block word-diffs the raw text. `renderBlock` is not used.
+   * Absent, the view renders exactly as before.
+   */
+  codeDocument?: PlanDiffCodeDocument;
 }
 
-export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
+const DEFAULT_UNCHANGED_CLASS = "opacity-60 hover:opacity-100 transition-opacity";
+
+/**
+ * The strike on a removed block. A config file's chunks strike their own text
+ * instead (see `chunkSegments`), so a removed line's indentation stays unstruck.
+ */
+const STRIKE_CLASS = "line-through decoration-destructive/30";
+
+/**
+ * The diff is a view of the source: `[^1]`, character references and bare
+ * `www.` / e-mail addresses stay as written in every block it draws (its own
+ * inline renderer, the shared quote and list pieces, a host's `renderBlock`).
+ */
+export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = (props) => (
+  <SourceLikeInlineContext.Provider value={true}>
+    <PlanCleanDiffViewBody {...props} />
+  </SourceLikeInlineContext.Provider>
+);
+
+const PlanCleanDiffViewBody: React.FC<PlanCleanDiffViewProps> = ({
   blocks,
   annotations = [],
   onAddAnnotation,
-  onSelectAnnotation,
   selectedAnnotationId = null,
   mode = "selection",
   wordLevel = true,
+  renderBlock,
+  lineGutter = false,
+  foldUnchanged = false,
+  unchangedClassName,
+  codeDocument,
 }) => {
   const modeRef = useRef<EditorMode>(mode);
   const onAddAnnotationRef = useRef(onAddAnnotation);
@@ -69,7 +158,14 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
     block: PlanDiffBlock;
     index: number;
     diffContext: Annotation['diffContext'];
+    /** The words dragged over when the composer opened: Ctrl+C copies them. */
+    selectedWords?: string;
   } | null>(null);
+
+  // A click on a block opens its composer, whose textarea then takes the
+  // focus and with it the person's selection, so Ctrl+C would copy nothing.
+  // Keep the words they dragged over inside that block.
+  useHighlightCopy(commentPopover?.selectedWords);
 
   const [quickLabelPicker, setQuickLabelPicker] = useState<{
     anchorEl: HTMLElement;
@@ -233,6 +329,7 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
       block: hoveredBlock.block,
       index: hoveredBlock.index,
       diffContext: hoveredBlock.diffContext,
+      selectedWords: selectedWordsIn(hoveredBlock.element),
     });
     setHoveredBlock(null);
   };
@@ -278,6 +375,7 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
         block,
         index,
         diffContext,
+        selectedWords: selectedWordsIn(element),
       });
     }
   }, [createDiffAnnotation, getBlockContent]);
@@ -285,22 +383,106 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
   // Check if a block index has been annotated (for highlight ring)
   const isBlockAnnotated = (index: number) => annotatedBlockIds.has(`diff-block-${index}`);
 
+  // Fold state per fold key (expanded folds render their pieces in place).
+  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleFold = useCallback((key: string) => {
+    setExpandedFolds((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+  const segments = useMemo(
+    () => (foldUnchanged ? foldUnchangedPlanDiff(blocks) : null),
+    [blocks, foldUnchanged],
+  );
+
+  const renderDiffBlock = (block: PlanDiffBlock, index: number, key: React.Key) => {
+    const rendered = (
+      <DiffBlockRenderer
+        key={lineGutter ? undefined : key}
+        block={block}
+        index={index}
+        hoveredIndex={hoveredBlock?.index ?? null}
+        hoveredDiffContext={hoveredBlock?.diffContext}
+        isBlockAnnotated={isBlockAnnotated}
+        wordLevel={wordLevel}
+        unchangedClassName={unchangedClassName}
+        onHover={onAddAnnotation ? (el, diffContext) => handleHover(el, block, index, diffContext) : undefined}
+        onLeave={onAddAnnotation ? handleLeave : undefined}
+        onClick={onAddAnnotation ? (el, diffContext) => handleBlockClick(block, index, el, diffContext) : undefined}
+      />
+    );
+    if (!lineGutter) return rendered;
+    return (
+      <GutterRow key={key} labels={blockGutterLabels(block)}>
+        {rendered}
+      </GutterRow>
+    );
+  };
+
+  const renderFold = (fold: PlanDiffFold, index: number) => {
+    const expanded = expandedFolds.has(fold.key);
+    const noun = fold.sectionCount === 1 ? "section" : "sections";
+    const row = expanded ? (
+      <button
+        type="button"
+        data-plan-diff-fold=""
+        aria-expanded
+        onClick={() => toggleFold(fold.key)}
+        className="annotation-exclude flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+      >
+        <FoldChevron expanded />
+        Hide {fold.sectionCount} unchanged {noun}
+      </button>
+    ) : (
+      <button
+        type="button"
+        data-plan-diff-fold=""
+        aria-expanded={false}
+        onClick={() => toggleFold(fold.key)}
+        className="annotation-exclude flex w-full min-w-0 items-center gap-2 rounded-md bg-muted/40 px-3 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+      >
+        <FoldChevron expanded={false} />
+        <span className="flex-none">{fold.sectionCount} unchanged {noun}</span>
+        {fold.headings.length > 0 && (
+          <span className="min-w-0 truncate text-muted-foreground/70">
+            · {fold.headings.join(" · ")}
+          </span>
+        )}
+        <span className="ml-auto flex-none pl-2">Show</span>
+      </button>
+    );
+    return (
+      <React.Fragment key={fold.key}>
+        {lineGutter ? (
+          <GutterRow labels={expanded ? [] : [rangeLabel(fold.newStart, fold.newEnd) ?? ""]}>{row}</GutterRow>
+        ) : (
+          row
+        )}
+        {expanded && fold.pieces.map((piece, i) => renderDiffBlock(piece, index, `${fold.key}-${i}`))}
+      </React.Fragment>
+    );
+  };
+
+  const body = segments
+    ? segments.map((segment, i) =>
+        segment.kind === "fold"
+          ? renderFold(segment, i)
+          : renderDiffBlock(segment.block, segment.index, `seg-${i}`),
+      )
+    : blocks.map((block, index) => renderDiffBlock(block, index, index));
+
   return (
     <div className="space-y-1">
-      {blocks.map((block, index) => (
-        <DiffBlockRenderer
-          key={index}
-          block={block}
-          index={index}
-          hoveredIndex={hoveredBlock?.index ?? null}
-          hoveredDiffContext={hoveredBlock?.diffContext}
-          isBlockAnnotated={isBlockAnnotated}
-          wordLevel={wordLevel}
-          onHover={onAddAnnotation ? (el, diffContext) => handleHover(el, block, index, diffContext) : undefined}
-          onLeave={onAddAnnotation ? handleLeave : undefined}
-          onClick={onAddAnnotation ? (el, diffContext) => handleBlockClick(block, index, el, diffContext) : undefined}
-        />
-      ))}
+      {codeDocument ? (
+        <CodeDocumentContext.Provider value={codeDocument}>{body}</CodeDocumentContext.Provider>
+      ) : renderBlock ? (
+        <RenderBlockContext.Provider value={renderBlock}>{body}</RenderBlockContext.Provider>
+      ) : (
+        body
+      )}
 
       {/* Block hover toolbar (selection mode) */}
       {hoveredBlock && !commentPopover && !quickLabelPicker && (
@@ -349,6 +531,71 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
   );
 };
 
+// --- Line gutter + fold row (optional seams) ---
+
+/** The words the person has selected inside `element`, for Ctrl+C once its
+ *  composer has the focus; undefined when the selection is elsewhere or empty. */
+function selectedWordsIn(element: HTMLElement): string | undefined {
+  const live = window.getSelection();
+  if (!live || live.isCollapsed || live.rangeCount === 0) return undefined;
+  if (!element.contains(live.getRangeAt(0).commonAncestorContainer)) return undefined;
+  const text = live.toString();
+  return text.trim() ? text : undefined;
+}
+
+/** "11–12", or "14" for one line; null when the side has no lines. */
+function rangeLabel(start?: number, end?: number): string | null {
+  if (start === undefined) return null;
+  return end !== undefined && end !== start ? `${start}–${end}` : `${start}`;
+}
+
+/** The gutter lines for one rendered diff block. */
+function blockGutterLabels(block: PlanDiffBlock): string[] {
+  const newLabel = rangeLabel(block.newStart, block.newEnd);
+  const oldLabel = rangeLabel(block.oldStart, block.oldEnd);
+  switch (block.type) {
+    case "removed":
+      return oldLabel ? [`old ${oldLabel}`] : [];
+    case "modified":
+      return [newLabel, oldLabel ? `old ${oldLabel}` : null].filter((l): l is string => !!l);
+    default:
+      return newLabel ? [newLabel] : [];
+  }
+}
+
+/** A block beside its source-line gutter. The gutter is never selectable or part of a quote. */
+// Baseline alignment puts the label beside the first line of text, past a
+// heading's top margin.
+const GutterRow: React.FC<{ labels: string[]; children: React.ReactNode }> = ({ labels, children }) => (
+  <div className="flex items-baseline gap-3">
+    <div
+      data-plan-diff-gutter=""
+      aria-hidden="true"
+      className="annotation-exclude w-[4.5rem] flex-none select-none text-right font-mono text-[11px] leading-4 tabular-nums text-muted-foreground/70"
+    >
+      {labels.map((label, i) => (
+        <div key={i}>{label}</div>
+      ))}
+    </div>
+    <div className="min-w-0 flex-1">{children}</div>
+  </div>
+);
+
+const FoldChevron: React.FC<{ expanded: boolean }> = ({ expanded }) => (
+  <svg
+    aria-hidden="true"
+    className={`h-3 w-3 flex-none transition-transform ${expanded ? "rotate-90" : ""}`}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={2.5}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M9 6l6 6-6 6" />
+  </svg>
+);
+
 // --- DiffBlockRenderer with hover support ---
 
 interface DiffBlockRendererProps {
@@ -359,14 +606,17 @@ interface DiffBlockRendererProps {
   isBlockAnnotated: (index: number) => boolean;
   /** When false, force block-level fallback even if inlineTokens is populated. */
   wordLevel: boolean;
+  /** Replaces the default unchanged-block dimming classes when set. */
+  unchangedClassName?: string;
   onHover?: (element: HTMLElement, diffContext: Annotation['diffContext']) => void;
   onLeave?: () => void;
   onClick?: (element: HTMLElement, diffContext: Annotation['diffContext']) => void;
 }
 
 const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
-  block, index, hoveredIndex, hoveredDiffContext, isBlockAnnotated, wordLevel, onHover, onLeave, onClick,
+  block, index, hoveredIndex, hoveredDiffContext, isBlockAnnotated, wordLevel, unchangedClassName, onHover, onLeave, onClick,
 }) => {
+  const codeDocument = useContext(CodeDocumentContext);
   const hoverProps = (diffContext: Annotation['diffContext']) => onHover ? {
     onMouseEnter: (e: React.MouseEvent<HTMLElement>) => onHover(e.currentTarget, diffContext),
     onMouseLeave: () => onLeave?.(),
@@ -386,7 +636,13 @@ const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
   switch (block.type) {
     case "unchanged":
       return (
-        <div className="plan-diff-unchanged opacity-60 hover:opacity-100 transition-opacity">
+        <div
+          className={`plan-diff-unchanged ${unchangedClassName ?? DEFAULT_UNCHANGED_CLASS}`}
+          data-doc-text=""
+          // A config file reads by its columns: line its unchanged chunks up
+          // with the changed ones, which sit past a 3px border and 0.75rem.
+          style={codeDocument ? { paddingLeft: "calc(3px + 0.75rem)" } : undefined}
+        >
           <MarkdownChunk content={block.content} />
         </div>
       );
@@ -405,20 +661,41 @@ const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
     case "removed":
       return (
         <div
-          className={`plan-diff-removed line-through decoration-destructive/30 opacity-70 transition-shadow ${ringClass('removed')}`}
+          className={`plan-diff-removed ${codeDocument ? "" : `${STRIKE_CLASS} `}opacity-70 transition-shadow ${ringClass('removed')}`}
           data-diff-block-index={index}
           {...hoverProps('removed')}
         >
-          <MarkdownChunk content={block.content} />
+          <MarkdownChunk content={block.content} side="old" />
         </div>
       );
 
-    case "modified":
+    case "modified": {
+      // A config file word-diffs its raw text; the engine's tokens come from
+      // the markdown parse, which drops a comment's `#` and reads `- ` as a list.
+      const codeTokens = codeDocument && wordLevel ? computeCodeInlineDiff(block.oldContent ?? "", block.content) : null;
+      if (codeDocument && codeTokens) {
+        const { style: hoverStyle, ...hoverRest } = hoverProps('modified');
+        return (
+          <div
+            data-diff-block-index={index}
+            className={`plan-diff-modified transition-shadow ${ringClass('modified')}`}
+            style={hoverStyle}
+            {...hoverRest}
+          >
+            <CodeWordDiff
+              oldText={block.oldContent ?? ""}
+              newText={block.content}
+              tokens={codeTokens}
+              language={codeDocument.language}
+            />
+          </div>
+        );
+      }
       // When the engine populated inlineTokens, we render a single in-context
       // block with <ins>/<del> spans inside the structural wrapper. Falls
       // back to the stacked strike-through rendering when tokens are absent
       // (gate rejected: code/table/structural mismatch/inline-code hazard).
-      if (wordLevel && block.inlineTokens && block.inlineWrap) {
+      if (!codeDocument && wordLevel && block.inlineTokens && block.inlineWrap) {
         return (
           <InlineModifiedBlock
             tokens={block.inlineTokens}
@@ -432,10 +709,10 @@ const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
       return (
         <div data-diff-block-index={index}>
           <div
-            className={`plan-diff-removed line-through decoration-destructive/30 opacity-60 transition-shadow ${ringClass('removed')}`}
+            className={`plan-diff-removed ${codeDocument ? "" : `${STRIKE_CLASS} `}opacity-60 transition-shadow ${ringClass('removed')}`}
             {...hoverProps('removed')}
           >
-            <MarkdownChunk content={block.oldContent!} />
+            <MarkdownChunk content={block.oldContent!} side="old" />
           </div>
           <div
             className={`plan-diff-added transition-shadow ${ringClass('modified')}`}
@@ -445,6 +722,7 @@ const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
           </div>
         </div>
       );
+    }
 
     default:
       return null;
@@ -566,7 +844,89 @@ const InlineModifiedBlock: React.FC<InlineModifiedBlockProps> = ({
 
 // --- Rendering components (unchanged from main) ---
 
-const MarkdownChunk: React.FC<{ content: string }> = ({ content }) => {
+/**
+ * One chunk of a config or data file: its own lines in monospace, highlighted
+ * in the file's language. Chunks sit flush so the diff reads as one file; the
+ * `pn-code` fence styling (padding, its own background) would box each one.
+ */
+const CODE_CHUNK_CLASS = "font-mono text-[13px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere] px-2 py-0.5 m-0 bg-transparent";
+
+/** A chunk ends with its last line's newline, which is not another line. */
+const chunkText = (content: string) => content.replace(/\n$/, "");
+
+/**
+ * Shiki's runs for `text` in `language`, or null while the grammar attaches
+ * (the chunk shows plain, then re-renders once it is ready) or without one.
+ */
+function useHighlightRuns(text: string, language: string | undefined): HighlightRun[] | null {
+  const fenceTheme = useFenceTheme();
+  const [attached, setAttached] = useState(0);
+  const runs = useMemo(
+    () => (language ? highlightToRuns(text, language, fenceTheme) : null),
+    // `attached` re-reads the runs once ensureHighlight below lands.
+    [text, language, fenceTheme, attached],
+  );
+  const waiting = Boolean(language) && runs === null;
+  useEffect(() => {
+    if (!waiting || !language) return;
+    let live = true;
+    void ensureHighlight(language, fenceTheme).then((ok) => {
+      if (ok && live) setAttached((n) => n + 1);
+    });
+    return () => {
+      live = false;
+    };
+  }, [waiting, language, fenceTheme]);
+  return runs;
+}
+
+const CodeChunk: React.FC<{ content: string; language?: string; side: PlanDiffSide }> = ({ content, language, side }) => {
+  const text = chunkText(content);
+  const runs = useHighlightRuns(text, language);
+  const html = useMemo(() => codeSegmentsToHtml(chunkSegments(text, runs, side === "old")), [text, runs, side]);
+  return (
+    <pre className={CODE_CHUNK_CLASS} data-plan-diff-code="">
+      <code
+        className={`font-mono${language ? ` language-${language}` : ""}`}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    </pre>
+  );
+};
+
+/** A modified block's word diff, each side's words in that side's colours. */
+const CodeWordDiff: React.FC<{
+  oldText: string;
+  newText: string;
+  tokens: InlineDiffToken[];
+  language?: string;
+}> = ({ oldText, newText, tokens, language }) => {
+  const oldPlain = chunkText(oldText);
+  const newPlain = chunkText(newText);
+  const oldRuns = useHighlightRuns(oldPlain, language);
+  const newRuns = useHighlightRuns(newPlain, language);
+  const html = useMemo(
+    () => codeSegmentsToHtml(wordDiffSegments(oldPlain, newPlain, tokens, oldRuns, newRuns)),
+    [oldPlain, newPlain, tokens, oldRuns, newRuns],
+  );
+  return (
+    <pre className={CODE_CHUNK_CLASS} data-plan-diff-code="">
+      <code
+        className={`font-mono${language ? ` language-${language}` : ""}`}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    </pre>
+  );
+};
+
+const MarkdownChunk: React.FC<{ content: string; side?: PlanDiffSide }> = ({ content, side = "new" }) => {
+  const codeDocument = useContext(CodeDocumentContext);
+  if (codeDocument) return <CodeChunk content={content} language={codeDocument.language} side={side} />;
+  return <ParsedMarkdownChunk content={content} side={side} />;
+};
+
+const ParsedMarkdownChunk: React.FC<{ content: string; side: PlanDiffSide }> = ({ content, side }) => {
+  const renderBlock = useContext(RenderBlockContext);
   const blocks = React.useMemo(
     () => parseMarkdownToBlocks(content),
     [content]
@@ -579,6 +939,16 @@ const MarkdownChunk: React.FC<{ content: string }> = ({ content }) => {
     () => computeListIndices(blocks),
     [blocks]
   );
+
+  if (renderBlock) {
+    return (
+      <>
+        {blocks.map((block, i) => (
+          <React.Fragment key={block.id}>{renderBlock(block, orderedIndices[i], side)}</React.Fragment>
+        ))}
+      </>
+    );
+  }
 
   return (
     <>
@@ -606,18 +976,23 @@ const SimpleBlockRenderer: React.FC<{ block: Block; orderedIndex?: number | null
     }
 
     case "blockquote": {
-      // Split on blank-line paragraph breaks so merged `> a\n>\n> b`
-      // renders as two <p> children instead of collapsing to one line.
-      const paragraphs = block.content.split(/\n\n+/);
-      return (
-        <blockquote className="border-l-2 border-primary/50 pl-4 my-4 text-muted-foreground italic">
-          {paragraphs.map((para, i) => (
-            <p key={i} className={i > 0 ? "mt-2" : ""}>
-              <InlineMarkdown text={para} />
-            </p>
-          ))}
-        </blockquote>
-      );
+      // The document's quote renderer, without a block id (the diff view
+      // keeps none): a prose quote renders as it always has, and a quote
+      // with a code fence, a list or a nested quote renders them inside one
+      // quote. Alerts keep the plain quote look they have always had here.
+      if (block.alertKind) {
+        const paragraphs = block.content.split(/\n\n+/);
+        return (
+          <blockquote className={BLOCKQUOTE_CLASS_NAME}>
+            {paragraphs.map((para, i) => (
+              <p key={i} className={i > 0 ? "mt-2" : ""}>
+                <InlineMarkdown text={para} />
+              </p>
+            ))}
+          </blockquote>
+        );
+      }
+      return <BlockquoteBlock block={{ ...block, id: undefined as unknown as string }} />;
     }
 
     case "list-item": {
@@ -648,17 +1023,8 @@ const SimpleBlockRenderer: React.FC<{ block: Block; orderedIndex?: number | null
       return <hr className="border-border/30 my-8" />;
 
     case "table": {
-      const lines = block.content.split('\n').filter(line => line.trim());
-      if (lines.length === 0) return null;
-      const parseRow = (line: string): string[] =>
-        line.replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
-      const headers = parseRow(lines[0]);
-      const rows: string[][] = [];
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (/^[\|\-:\s]+$/.test(line)) continue;
-        rows.push(parseRow(line));
-      }
+      const { headers, rows } = parseTableContent(block.content);
+      if (headers.length === 0) return null;
       return (
         <div className="my-4 overflow-x-auto">
           <table className="min-w-full border-collapse text-sm">
@@ -744,6 +1110,12 @@ function sanitizeLinkUrl(url: string): string | null {
 }
 
 const InlineMarkdown: React.FC<{ text: string }> = ({ text }) => {
+  // A host's image and link rules (ImageResolverContext, LocalLinkContext and
+  // LocalLinkMatchContext), as the document view applies them. With no
+  // provider, every image and link renders exactly as before.
+  const resolveImage = useImageResolver();
+  const resolveLocalLink = useLocalLinkResolver();
+  const matchLocalLink = useLocalLinkMatch();
   const parts: React.ReactNode[] = [];
   let remaining = text;
   let key = 0;
@@ -825,7 +1197,66 @@ const InlineMarkdown: React.FC<{ text: string }> = ({ text }) => {
       continue;
     }
 
+    // Images, only with a host resolver: what it answers is drawn (a
+    // placeholder for `unavailable`, its `src` otherwise). Without one, or
+    // when it answers null, `!` and the link render as they always have.
+    match = resolveImage ? remaining.match(/^!\[([^\]]*)\]\(([^)]+)\)/) : null;
+    const resolvedImage = match ? resolveImage!(match[2]) : null;
+    if (match && resolvedImage) {
+      parts.push(
+        resolvedImage.kind === "unavailable" ? (
+          <span key={key++} className={UNAVAILABLE_IMAGE_CLASS} title={resolvedImage.title} data-image-unavailable="">
+            {match[1] || "Image"}
+          </span>
+        ) : (
+          <img key={key++} src={resolvedImage.src} alt={match[1]} width={resolvedImage.width} className="max-w-full rounded my-2" loading="lazy" />
+        ),
+      );
+      remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
+      continue;
+    }
+
     match = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
+    const localLink = match && resolveLocalLink && matchLocalLink(match[2]) ? resolveLocalLink(match[2]) : null;
+    if (match && localLink) {
+      // A host's answer for this link: inert text with its tooltip, or a link
+      // whose click the host handles (the browser never follows it).
+      const label = <InlineMarkdown text={match[1]} />;
+      if (localLink.kind === "unavailable") {
+        const inert = (
+          <span className="text-muted-foreground underline decoration-dotted underline-offset-2" data-local-link="unavailable">
+            {label}
+          </span>
+        );
+        parts.push(
+          localLink.wrap ? (
+            <React.Fragment key={key++}>{localLink.wrap(inert)}</React.Fragment>
+          ) : (
+            <span key={key++} title={localLink.title}>{inert}</span>
+          ),
+        );
+        if (localLink.after) parts.push(<React.Fragment key={key++}>{localLink.after}</React.Fragment>);
+      } else {
+        const link = (
+          <a
+            href={localLink.href ?? match[2]}
+            title={localLink.wrap ? undefined : localLink.title}
+            onClick={(event) => {
+              event.preventDefault();
+              localLink.open();
+            }}
+            className="text-primary underline underline-offset-2 hover:text-primary/80"
+          >
+            {label}
+          </a>
+        );
+        parts.push(<React.Fragment key={key++}>{localLink.wrap ? localLink.wrap(link) : link}</React.Fragment>);
+      }
+      remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
+      continue;
+    }
     if (match) {
       // Recursively parse the anchor text so <ins>/<del> diff tags (and
       // other inline markdown) inside the link render correctly instead of

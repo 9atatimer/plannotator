@@ -11,8 +11,18 @@
  */
 
 import type { OpencodeClient } from "@opencode-ai/sdk";
+import { randomBytes } from "node:crypto";
 import { BaseSession } from "../base-session.ts";
 import { buildSystemPrompt } from "../context.ts";
+import { withAskAiChildEnv } from "./ask-ai-env.ts";
+import {
+	consumeOpenCodeV2Event,
+	createOpenCodeV2QueryState,
+	detectOpenCodeV2,
+	OpenCodeV2Client,
+	parseOpenCodeModel,
+	type OpenCodeV2Event,
+} from "./opencode-v2.ts";
 import type {
 	AIMessage,
 	AIProvider,
@@ -27,6 +37,22 @@ import type {
 // ---------------------------------------------------------------------------
 
 const PROVIDER_NAME = "opencode-sdk";
+
+function withOpenCodeServerAuth<T>(password: string, start: () => T): T {
+	// OpenCode 2 reads OPENCODE_PASSWORD before the legacy OPENCODE_SERVER_PASSWORD, so a
+	// password the person's shell sets would otherwise win over ours. OpenCode 1 reads the legacy name.
+	const values = { OPENCODE_SERVER_USERNAME: "opencode", OPENCODE_PASSWORD: password, OPENCODE_SERVER_PASSWORD: password };
+	const saved = Object.keys(values).map((key) => [key, process.env[key]] as const);
+	Object.assign(process.env, values);
+	try {
+		return start();
+	} finally {
+		for (const [key, value] of saved) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
 
 // ---------------------------------------------------------------------------
 // SDK import cache — resolve once, reuse across all sessions
@@ -60,7 +86,9 @@ export class OpenCodeProvider implements AIProvider {
 	// biome-ignore lint/suspicious/noExplicitAny: SDK types not available at compile time
 	private server: { url: string; close: () => void } | null = null;
 	private client: OpencodeClient | null = null;
+	private v2: OpenCodeV2Client | null = null;
 	private startPromise: Promise<void> | null = null;
+	private startAbort: AbortController | null = null;
 	private exitHandler: (() => void) | null = null;
 	/**
 	 * Bumped by dispose() to invalidate an in-flight doStart: a spawn that
@@ -75,9 +103,10 @@ export class OpenCodeProvider implements AIProvider {
 
 	/** Spawn this process's OpenCode server if it is not already running. */
 	async ensureServer(): Promise<void> {
-		if (this.client) return;
+		if (this.client || this.v2) return;
+		const epoch = this.startEpoch;
 		this.startPromise ??= this.doStart().catch((err) => {
-			this.startPromise = null;
+			if (epoch === this.startEpoch) this.startPromise = null;
 			throw err;
 		});
 		return this.startPromise;
@@ -85,16 +114,47 @@ export class OpenCodeProvider implements AIProvider {
 
 	private async doStart(): Promise<void> {
 		const epoch = this.startEpoch;
+		const startup = new AbortController();
+		this.startAbort = startup;
 		const { createOpencodeServer, createOpencodeClient } = await getSDK();
 		// port 0 asks opencode for an OS-assigned free port (the SDK reads the
 		// real URL back from the child's "listening" line), so every Plannotator
 		// process gets its own server instead of piling onto a shared default
 		// port. An explicitly configured port is still honored verbatim.
-		const server: { url: string; close: () => void } = await createOpencodeServer({
-			hostname: this.config.hostname ?? "127.0.0.1",
-			port: this.config.port ?? 0,
-			timeout: 15_000,
-		});
+		let server: { url: string; close: () => void };
+		const password = randomBytes(32).toString("base64url");
+		const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+		try {
+			// Plannotator's integration off in this `opencode serve`
+			// (ask-ai-env.ts): the Plannotator OpenCode plugin it loads reads
+			// process.env and stands down. The SDK takes no env, so the switches
+			// are set on process.env only for the synchronous part of the call,
+			// where the SDK copies it into the spawn.
+			server = await withAskAiChildEnv(() => withOpenCodeServerAuth(password, () =>
+				createOpencodeServer({
+					hostname: this.config.hostname ?? "127.0.0.1",
+					port: this.config.port ?? 0,
+					timeout: 15_000,
+				}),
+			));
+		} catch (err: unknown) {
+			if (startup.signal.aborted || epoch !== this.startEpoch) {
+				throw new Error("OpenCode provider was disposed during startup.");
+			}
+			// A missing CLI is a spawn error with code ENOENT in every runtime
+			// (Node: "spawn opencode ENOENT"; Bun: "Executable not found in
+			// $PATH"; cross-spawn re-emits the Windows cmd.exe miss the same
+			// way). Match the code only: the SDK's other failures embed the
+			// child's stderr in the message, which can say "not found" for
+			// reasons that have nothing to do with the binary.
+			if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") {
+				throw new Error(
+					"OpenCode CLI (`opencode`) was not found on PATH. Install it (https://opencode.ai) or choose a different AI provider.",
+					{ cause: err },
+				);
+			}
+			throw err;
+		}
 		// A SIGINT/SIGTERM death is routed through process.exit() by the CLI, so
 		// an "exit" handler is what keeps Ctrl-C from orphaning the spawned
 		// `opencode serve` child (server.close() kills it synchronously). The
@@ -129,14 +189,26 @@ export class OpenCodeProvider implements AIProvider {
 		}
 
 		try {
-			this.client = createOpencodeClient({
-				baseUrl: server.url,
-				directory: this.config.cwd ?? process.cwd(),
-			});
+			const v2 = await detectOpenCodeV2(server.url, authorization, startup.signal);
+			if (epoch !== this.startEpoch) {
+				throw new Error("OpenCode provider was disposed during startup.");
+			}
+			if (v2) {
+				this.v2 = new OpenCodeV2Client(server.url, authorization);
+			} else {
+				this.client = createOpencodeClient({
+					baseUrl: server.url,
+					directory: this.config.cwd ?? process.cwd(),
+					headers: { Authorization: authorization },
+				});
+			}
 		} catch (err) {
 			// A post-spawn failure must not leak the child: close it and drop the
 			// handler so a retry starts from a clean slate.
 			reap();
+			if (startup.signal.aborted || epoch !== this.startEpoch) {
+				throw new Error("OpenCode provider was disposed during startup.");
+			}
 			throw err;
 		}
 		this.server = server;
@@ -152,6 +224,22 @@ export class OpenCodeProvider implements AIProvider {
 
 	async createSession(options: CreateSessionOptions): Promise<AISession> {
 		await this.ensureServer();
+		if (this.v2) {
+			const model = parseOpenCodeModel(options.model);
+			const data = await this.v2.request<{ id: string }>("/api/session", {
+				location: { directory: options.cwd ?? this.config.cwd ?? process.cwd() },
+				...(model && { model }),
+				...(options.oneShot && { permissions: [{ action: "*", resource: "*", effect: "deny" }] }),
+			});
+			return new OpenCodeSession({
+				sessionId: data.id,
+				systemPrompt: options.oneShot?.systemPrompt ?? buildSystemPrompt(options.context),
+				client: null,
+				v2: this.v2,
+				parentSessionId: null,
+				firstEventTimeoutMs: this.config.firstEventTimeoutMs,
+			});
+		}
 		const client = this.getClient();
 
 		const result = await client.session.create({
@@ -164,22 +252,37 @@ export class OpenCodeProvider implements AIProvider {
 
 		const session = new OpenCodeSession({
 			sessionId: sessionData.id,
-			systemPrompt: buildSystemPrompt(options.context),
+			systemPrompt: options.oneShot?.systemPrompt ?? buildSystemPrompt(options.context),
 			client,
 			model: options.model,
 			parentSessionId: null,
+			firstEventTimeoutMs: this.config.firstEventTimeoutMs,
+			noTools: !!options.oneShot,
 		});
 		return session;
 	}
 
 	async forkSession(options: CreateSessionOptions): Promise<AISession> {
 		await this.ensureServer();
-		const client = this.getClient();
 
 		const parentId = options.context.parent?.sessionId;
 		if (!parentId) {
 			throw new Error("Fork requires a parent session ID.");
 		}
+		if (this.v2) {
+			const data = await this.v2.request<{ id: string }>(`/api/session/${encodeURIComponent(parentId)}/fork`, {});
+			const model = parseOpenCodeModel(options.model);
+			if (model) await this.v2.request(`/api/session/${encodeURIComponent(data.id)}/model`, { model });
+			return new OpenCodeSession({
+				sessionId: data.id,
+				systemPrompt: buildSystemPrompt(options.context),
+				client: null,
+				v2: this.v2,
+				parentSessionId: parentId,
+				firstEventTimeoutMs: this.config.firstEventTimeoutMs,
+			});
+		}
+		const client = this.getClient();
 
 		const result = await client.session.fork({
 			path: { id: parentId },
@@ -195,11 +298,23 @@ export class OpenCodeProvider implements AIProvider {
 			client,
 			model: options.model,
 			parentSessionId: parentId,
+			firstEventTimeoutMs: this.config.firstEventTimeoutMs,
 		});
 	}
 
 	async resumeSession(sessionId: string): Promise<AISession> {
 		await this.ensureServer();
+		if (this.v2) {
+			await this.v2.request(`/api/session/${encodeURIComponent(sessionId)}`);
+			return new OpenCodeSession({
+				sessionId,
+				systemPrompt: null,
+				client: null,
+				v2: this.v2,
+				parentSessionId: null,
+				firstEventTimeoutMs: this.config.firstEventTimeoutMs,
+			});
+		}
 		const client = this.getClient();
 
 		// Verify session exists
@@ -211,6 +326,7 @@ export class OpenCodeProvider implements AIProvider {
 			client,
 			model: undefined,
 			parentSessionId: null,
+			firstEventTimeoutMs: this.config.firstEventTimeoutMs,
 		});
 	}
 
@@ -218,6 +334,8 @@ export class OpenCodeProvider implements AIProvider {
 		// Invalidate any in-flight doStart so a spawn completing after this
 		// point reaps itself instead of resurrecting the provider.
 		this.startEpoch++;
+		this.startAbort?.abort();
+		this.startAbort = null;
 		if (this.exitHandler) {
 			process.removeListener("exit", this.exitHandler);
 			this.exitHandler = null;
@@ -227,6 +345,7 @@ export class OpenCodeProvider implements AIProvider {
 			this.server = null;
 		}
 		this.client = null;
+		this.v2 = null;
 		this.startPromise = null;
 	}
 
@@ -234,6 +353,22 @@ export class OpenCodeProvider implements AIProvider {
 	async fetchModels(): Promise<void> {
 		try {
 			await this.ensureServer();
+			if (this.v2) {
+				const query = new URLSearchParams({ "location[directory]": this.config.cwd ?? process.cwd() });
+				type Model = { id: string; providerID: string; name?: string; enabled: boolean };
+				const models = await this.v2.request<Model[]>(`/api/model?${query}`);
+				const preferred = await this.v2.request<Model | null>(`/api/model/default?${query}`);
+				const available = models.filter((model) => model.enabled).map((model) => ({
+					id: `${model.providerID}/${model.id}`,
+					label: `${model.name ?? model.id} (${model.providerID})`,
+					default: model.id === preferred?.id && model.providerID === preferred?.providerID,
+				}));
+				if (available.length) {
+					if (!available.some((model) => model.default)) available[0].default = true;
+					this.models = available;
+				}
+				return;
+			}
 			const client = this.getClient();
 
 			const result = await client.provider.list({
@@ -277,6 +412,7 @@ export class OpenCodeProvider implements AIProvider {
 // ---------------------------------------------------------------------------
 
 interface SessionConfig {
+	v2?: OpenCodeV2Client;
 	sessionId: string;
 	systemPrompt: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: SDK types not available at compile time
@@ -284,6 +420,10 @@ interface SessionConfig {
 	/** Model in "providerID/modelID" format. */
 	model?: string;
 	parentSessionId: string | null;
+	/** How long to wait for the event stream's first frame before prompting. */
+	firstEventTimeoutMs?: number;
+	/** A single judgment (`CreateSessionOptions.oneShot`): every tool off for this prompt. */
+	noTools?: boolean;
 }
 
 class OpenCodeSession extends BaseSession {
@@ -304,7 +444,7 @@ class OpenCodeSession extends BaseSession {
 			yield BaseSession.BUSY_ERROR;
 			return;
 		}
-		const { gen } = started;
+		const { gen, signal } = started;
 
 		try {
 			// Build model param if specified
@@ -317,23 +457,88 @@ class OpenCodeSession extends BaseSession {
 				}
 			}
 
-			// Subscribe to SSE events
-			const { stream } = await this.config.client.event.subscribe();
+			// Open the SSE stream and wait for the first frame *before* prompting.
+			// OpenCode 1.18+ can finish a short turn before a late subscriber
+			// connects; Ask AI then hangs until the browser reports Failed to fetch.
+			// The subscription has its own controller (aborted with the query) so a
+			// first frame that never comes can end it too: the SDK's stream retries
+			// a failed connection forever, and an async generator's return() waits
+			// behind a pending next().
+			const subscription = new AbortController();
+			const abortSubscription = () => subscription.abort();
+			signal.addEventListener("abort", abortSubscription, { once: true });
+			if (signal.aborted) subscription.abort();
+			let iterator: AsyncIterator<OpenCodeV2Event & { properties?: Record<string, unknown> }> | null = null;
 
 			try {
-				// Send prompt asynchronously
+				// The v1 client takes one options object; a signal in a second
+				// argument is ignored and the connection is never closed.
+				const { stream } = this.config.v2
+					? { stream: this.config.v2.events(subscription.signal) }
+					: await this.config.client.event.subscribe({ signal: subscription.signal });
+				const events: AsyncIterator<OpenCodeV2Event & { properties?: Record<string, unknown> }> =
+					stream[Symbol.asyncIterator]();
+				iterator = events;
+				// First frame only proves the subscriber is live. Do not treat it as
+				// this turn — it can be server.connected or leftover idle from a
+				// previous query on the same session.
+				const first = await nextEventWithin(
+					events,
+					this.config.firstEventTimeoutMs ?? OPENCODE_FIRST_EVENT_TIMEOUT_MS,
+					signal,
+				);
+				if (first === "aborted") {
+					yield { type: "error", error: "OpenCode query aborted.", code: "provider_error" };
+					return;
+				}
+				if (first === "timeout") {
+					yield {
+						type: "error",
+						error: "OpenCode's event stream did not connect, so the question was not sent.",
+						code: "provider_error",
+					};
+					return;
+				}
+				if (first.done) {
+					yield {
+						type: "error",
+						error: "OpenCode event stream closed before the prompt was sent.",
+						code: "provider_error",
+					};
+					return;
+				}
+
 				try {
-					await this.config.client.session.promptAsync({
-						path: { id: this.config.sessionId },
-						body: {
-							...(!this._firstQuerySent &&
-								this.config.systemPrompt && {
-									system: this.config.systemPrompt,
-								}),
-							...(modelParam && { model: modelParam }),
-							parts: [{ type: "text", text: prompt }],
-						},
-					});
+					if (this.config.v2) {
+						const path = `/api/session/${encodeURIComponent(this.config.sessionId)}`;
+						// Synthetic input queues context without starting a turn; /prompt has no system field.
+						if (!this._firstQuerySent && this.config.systemPrompt) {
+							await this.config.v2.request(`${path}/synthetic`, {
+								text: this.config.systemPrompt, resume: false,
+							}, signal);
+							this._firstQuerySent = true;
+						}
+						await this.config.v2.request(`${path}/prompt`, { text: prompt }, signal);
+					} else {
+						const result = await this.config.client.session.promptAsync({
+							path: { id: this.config.sessionId },
+							body: {
+								...(!this._firstQuerySent &&
+									this.config.systemPrompt && {
+										system: this.config.systemPrompt,
+									}),
+								...(modelParam && { model: modelParam }),
+								// `variant`: the low effort of a model that has one; anything else ignores it.
+								...(this.config.noTools && { tools: { "*": false }, variant: "low" }),
+								parts: [{ type: "text", text: prompt }],
+							},
+						});
+						// The SDK resolves HTTP errors as result objects by default.
+						if (result.error) {
+							const detail = typeof result.error === "string" ? result.error : result.error.data?.message;
+							throw new Error(detail || `HTTP ${result.response.status}`);
+						}
+					}
 				} catch (err) {
 					yield {
 						type: "error",
@@ -344,29 +549,32 @@ class OpenCodeSession extends BaseSession {
 				}
 				this._firstQuerySent = true;
 
-				// Drain SSE events filtered by session ID
-				for await (const event of stream) {
-					const eventType = event.type as string;
-					const props = event.properties as Record<string, unknown> | undefined;
-					if (!props) continue;
-
-					// Filter: only events for our session
-					const eventSessionId =
-						(props.sessionID as string) ??
-						((props.info as Record<string, unknown>)?.sessionID as string) ??
-						((props.part as Record<string, unknown>)?.sessionID as string);
-					if (eventSessionId && eventSessionId !== this.config.sessionId) continue;
-
-					const mapped = mapOpenCodeEvent(eventType, props, this.id);
-					for (const msg of mapped) {
-						yield msg;
-						if (msg.type === "result" || (msg.type === "error" && isTerminalEvent(eventType))) {
-							return;
-						}
-					}
+				const state = createOpenCodeQueryState();
+				const v2State = createOpenCodeV2QueryState();
+				while (!signal.aborted) {
+					// Stop ends this wait at once; the stream itself can take up to
+					// its retry delay to notice the abort.
+					const next = await nextEventWithin(events, null, signal);
+					if (next === "aborted" || next === "timeout" || next.done) break;
+					const { messages, done } = this.config.v2
+						? consumeOpenCodeV2Event(next.value, this.config.sessionId, v2State)
+						: consumeOpenCodeEvent(next.value, this.config.sessionId, state);
+					for (const msg of messages) yield msg;
+					if (done) return;
 				}
+
+				yield {
+					type: "error",
+					error: signal.aborted
+						? "OpenCode query aborted."
+						: "OpenCode event stream ended without a result.",
+					code: "provider_error",
+				};
 			} finally {
-				stream.return?.();
+				// Abort first: it ends a pending next(), which return() waits behind.
+				signal.removeEventListener("abort", abortSubscription);
+				subscription.abort();
+				void Promise.resolve(iterator?.return?.()).catch(() => {});
 			}
 		} catch (err) {
 			yield {
@@ -380,6 +588,13 @@ class OpenCodeSession extends BaseSession {
 	}
 
 	abort(): void {
+		if (this.config.v2) {
+			void this.config.v2.request(
+				`/api/session/${encodeURIComponent(this.config.sessionId)}/interrupt`, {},
+			).catch(() => {});
+			super.abort();
+			return;
+		}
 		this.config.client.session
 			.abort({ path: { id: this.config.sessionId } })
 			.catch(() => {});
@@ -389,8 +604,15 @@ class OpenCodeSession extends BaseSession {
 	respondToPermission(
 		requestId: string,
 		allow: boolean,
-		_message?: string,
+		message?: string,
 	): void {
+		if (this.config.v2) {
+			void this.config.v2.request(
+				`/api/session/${encodeURIComponent(this.config.sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
+				{ decision: allow ? "once" : "reject", ...(message !== undefined && { message }) },
+			).catch(() => {});
+			return;
+		}
 		this.config.client
 			.postSessionIdPermissionsPermissionId({
 				path: { id: this.config.sessionId, permissionID: requestId },
@@ -407,6 +629,123 @@ class OpenCodeSession extends BaseSession {
 /** Returns true for events that should terminate the query when mapped to an error. */
 function isTerminalEvent(eventType: string): boolean {
 	return eventType === "session.error" || eventType === "session.status";
+}
+
+/** How long Ask AI waits for OpenCode's event stream to send its first frame. */
+export const OPENCODE_FIRST_EVENT_TIMEOUT_MS = 10_000;
+
+/**
+ * The iterator's next result, or "timeout" / "aborted" when neither comes
+ * first (`timeoutMs` null: no time limit). The caller ends the pending next()
+ * itself (by aborting its stream).
+ */
+export async function nextEventWithin<T>(
+	iterator: AsyncIterator<T>,
+	timeoutMs: number | null,
+	signal: AbortSignal,
+): Promise<IteratorResult<T> | "timeout" | "aborted"> {
+	if (signal.aborted) return "aborted";
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let onAbort: (() => void) | undefined;
+	const stop = new Promise<"timeout" | "aborted">((resolve) => {
+		if (timeoutMs !== null) timer = setTimeout(() => resolve("timeout"), timeoutMs);
+		onAbort = () => resolve("aborted");
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+	try {
+		return await Promise.race([iterator.next(), stop]);
+	} finally {
+		clearTimeout(timer);
+		if (onAbort) signal.removeEventListener("abort", onAbort);
+	}
+}
+
+export function openCodeEventSessionId(
+	props: Record<string, unknown>,
+): string | undefined {
+	return (
+		(props.sessionID as string | undefined) ??
+		((props.info as Record<string, unknown> | undefined)?.sessionID as
+			| string
+			| undefined) ??
+		((props.part as Record<string, unknown> | undefined)?.sessionID as
+			| string
+			| undefined)
+	);
+}
+
+/**
+ * OpenCode 1.18 still emits `message.part.delta` for streaming text, but some
+ * turns only land a final `message.part.updated` snapshot (or a late
+ * subscriber misses the deltas). Capture assistant text parts so Ask AI can
+ * still render an answer. User-prompt snapshots have no `time` stamp.
+ */
+export function assistantTextFromPartUpdate(
+	part: Record<string, unknown> | undefined,
+): string | undefined {
+	if (!part || part.type !== "text") return undefined;
+	if (part.time == null) return undefined;
+	const text = part.text;
+	return typeof text === "string" && text.length > 0 ? text : undefined;
+}
+
+export interface OpenCodeQueryState {
+	sawTextDelta: boolean;
+	lastAssistantText: string;
+}
+
+export function createOpenCodeQueryState(): OpenCodeQueryState {
+	return { sawTextDelta: false, lastAssistantText: "" };
+}
+
+/**
+ * If this turn never streamed `message.part.delta` text, emit the last
+ * assistant snapshot so Ask AI still has something to render (#514 / #907).
+ */
+export function fallbackAssistantText(state: OpenCodeQueryState): AIMessage[] {
+	if (state.sawTextDelta || !state.lastAssistantText) return [];
+	return [{ type: "text_delta", delta: state.lastAssistantText }];
+}
+
+/**
+ * Consume one OpenCode SSE event after promptAsync. Returns mapped Ask AI
+ * messages and whether the query should stop. Pre-prompt leftover idle is
+ * ignored by only calling this after the prompt is sent.
+ */
+export function consumeOpenCodeEvent(
+	event: { type?: string; properties?: Record<string, unknown> },
+	sessionId: string,
+	state: OpenCodeQueryState,
+): { messages: AIMessage[]; done: boolean } {
+	const eventType = event.type as string;
+	const props = event.properties;
+	if (props == null) return { messages: [], done: false };
+
+	const eventSessionId = openCodeEventSessionId(props);
+	if (eventSessionId && eventSessionId !== sessionId) {
+		return { messages: [], done: false };
+	}
+
+	if (eventType === "message.part.updated") {
+		const snapshot = assistantTextFromPartUpdate(
+			props.part as Record<string, unknown> | undefined,
+		);
+		if (snapshot) state.lastAssistantText = snapshot;
+	}
+
+	const mapped = mapOpenCodeEvent(eventType, props, sessionId);
+	const messages: AIMessage[] = [];
+	let done = false;
+	for (const msg of mapped) {
+		if (msg.type === "text_delta") state.sawTextDelta = true;
+		if (msg.type === "result") {
+			messages.push(...fallbackAssistantText(state));
+			done = true;
+		}
+		messages.push(msg);
+		if (msg.type === "error" && isTerminalEvent(eventType)) done = true;
+	}
+	return { messages, done };
 }
 
 /**
@@ -428,6 +767,8 @@ export function mapOpenCodeEvent(
 		case "message.part.delta": {
 			const field = props.field as string;
 			const delta = props.delta as string;
+			// Reasoning/thinking deltas share this event; Ask AI only renders
+			// assistant answer text.
 			if (field === "text" && delta) {
 				return [{ type: "text_delta", delta }];
 			}

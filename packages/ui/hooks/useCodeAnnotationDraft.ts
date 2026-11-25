@@ -7,11 +7,18 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { CodeAnnotation, Annotation, CommentAnnotation } from '../types';
-import { getDraftTransport } from './useAnnotationDraft';
+import { getDraftTransport, type DraftTransport } from './useAnnotationDraft';
+import { flushBeforeReload } from '../utils/beforeReload';
 
 const DEBOUNCE_MS = 500;
 /** Bound on one read of a switched-onto target's draft (#1590). */
 export const TARGET_LOAD_TIMEOUT_MS = 5000;
+
+/** A target-bound transport refuses to write into a different review. The host
+ * must refresh/adopt a target before saving can resume; retrying cannot fix it. */
+export class DraftTargetChangedError extends Error {
+  constructor() { super('Review draft target changed'); }
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -41,8 +48,8 @@ interface DraftData {
   autoViewSuppressed?: string[];
   draftGeneration?: number;
   /**
-   * Set by the review server (never by the client) when a PR draft is served
-   * through the PR's target key for a patch different from the one it was
+   * Set by the review server (never by the client) when a draft is served
+   * through its target key for a patch different from the one it was
    * saved on (#1590). The host re-checks line comments' anchors on restore.
    */
   patchChanged?: boolean;
@@ -65,6 +72,8 @@ function formatTimeAgo(ts: number): string {
 }
 
 interface UseCodeAnnotationDraftOptions {
+  /** Optional target-bound transport; the configured host transport is the default. */
+  transport?: DraftTransport;
   annotations: CodeAnnotation[];
   descriptionAnnotations?: Annotation[];
   commentAnnotations?: CommentAnnotation[];
@@ -72,6 +81,8 @@ interface UseCodeAnnotationDraftOptions {
   autoViewSuppressed?: Set<string>;
   isApiMode: boolean;
   submitted: boolean;
+  /** Hosts with independent review-progress storage omit viewed state from drafts. */
+  persistViewedFiles?: boolean;
   /** Receives the unsent items found on a target the session switched onto
    *  in place (#1590), already filtered to ids the session neither holds nor
    *  deleted. The host adds them to its state; autosave then saves the merge.
@@ -99,6 +110,10 @@ export interface CodeDraftTargetState {
 }
 
 interface UseCodeAnnotationDraftResult {
+  /** Flush pending edits, then hold autosave until adoptDraftTarget resumes it. */
+  flushBeforeSwitch: () => Promise<void>;
+  /** Keep unsaved annotations in memory and offer an in-place refresh. */
+  draftTargetChanged: boolean;
   draftBanner: { count: number; viewedCount: number; timeAgo: string } | null;
   /** `patchChanged` is true when the server served the draft for a patch other
    *  than the one it was saved on (the host re-checks line anchors). */
@@ -112,10 +127,11 @@ interface UseCodeAnnotationDraftResult {
    *  that one load settles (success, failure, or a newer switch) autosave does
    *  not write under the new target, so the switch cannot overwrite a draft
    *  it has not read yet; nothing else ever waits. */
-  adoptDraftTarget: (state: CodeDraftTargetState | undefined) => void;
+  adoptDraftTarget: (state: CodeDraftTargetState | undefined, transport?: DraftTransport) => void;
 }
 
 export function useCodeAnnotationDraft({
+  transport: transportOverride,
   annotations,
   descriptionAnnotations = [],
   commentAnnotations = [],
@@ -125,12 +141,31 @@ export function useCodeAnnotationDraft({
   submitted,
   onDraftTargetMerge,
   targetLoadTimeoutMs = TARGET_LOAD_TIMEOUT_MS,
+  persistViewedFiles = true,
 }: UseCodeAnnotationDraftOptions): UseCodeAnnotationDraftResult {
+  const transport = transportOverride ?? getDraftTransport();
+  const transportRef = useRef(transport);
+  transportRef.current = transport;
+  const pendingSaveRef = useRef<(() => Promise<void>) | null>(null);
+  const savingRef = useRef<Promise<void> | null>(null);
+  const switchPausedRef = useRef(false);
+  /** False once the host unmounted (a failed region's notice took its place, the page goes). */
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const [draftTargetChanged, setDraftTargetChanged] = useState(false);
+  const targetChangedRef = useRef(false);
   const [draftBanner, setDraftBanner] = useState<{ count: number; viewedCount: number; timeAgo: string } | null>(null);
   const draftDataRef = useRef<DraftData | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasMountedRef = useRef(false);
   const draftGenerationRef = useRef(0);
+  const persistViewedRef = useRef(persistViewedFiles);
+  persistViewedRef.current = persistViewedFiles;
   // True once the user has actually had annotations this session. Used to decide
   // whether an empty state is a real "cleared everything" edit (persist it) vs a
   // fresh/unengaged session (leave the server alone). Keyed on annotations only —
@@ -142,6 +177,14 @@ export function useCodeAnnotationDraft({
   // would overwrite a draft it has not merged yet) and remembers that it did,
   // so settling — success, failure, or supersede — always resumes saving.
   const switchSeqRef = useRef(0);
+  const reportTargetChanged = (error: unknown, seq: number): boolean => {
+    if (!(error instanceof DraftTargetChangedError)) return false;
+    if (seq === switchSeqRef.current) {
+      targetChangedRef.current = true;
+      setDraftTargetChanged(true);
+    }
+    return true;
+  };
   const awaitingTargetLoadRef = useRef(false);
   const skippedWhileAwaitingRef = useRef(false);
   // The switched-onto target's draft could not be read (both attempts failed
@@ -177,15 +220,22 @@ export function useCodeAnnotationDraft({
   // Load draft on mount
   useEffect(() => {
     if (!isApiMode) return;
+    const seq = switchSeqRef.current;
+    let cancelled = false;
 
-    getDraftTransport().load()
+    transportRef.current.load()
       .then(({ data, generation }) => {
+        if (cancelled || seq !== switchSeqRef.current) return null;
         if (generation !== null) {
           draftGenerationRef.current = Math.max(draftGenerationRef.current, generation);
         }
         return data as DraftData | null;
       })
       .then((data: DraftData | null) => {
+        if (cancelled || seq !== switchSeqRef.current) return;
+        // Keep even a viewed-only draft while independent progress support is
+        // unresolved; a failed/unsupported load may need to offer it later.
+        draftDataRef.current = data;
         const generation = readDraftGeneration(data?.draftGeneration);
         if (generation !== null) {
           draftGenerationRef.current = Math.max(draftGenerationRef.current, generation);
@@ -193,7 +243,7 @@ export function useCodeAnnotationDraft({
         const annotationCount = (Array.isArray(data?.codeAnnotations) ? data.codeAnnotations.length : 0)
           + (Array.isArray(data?.descriptionAnnotations) ? data.descriptionAnnotations.length : 0)
           + (Array.isArray(data?.commentAnnotations) ? data.commentAnnotations.length : 0);
-        const viewedCount = Array.isArray(data?.viewedFiles) ? data.viewedFiles.length : 0;
+        const viewedCount = persistViewedRef.current && Array.isArray(data?.viewedFiles) ? data.viewedFiles.length : 0;
         if (annotationCount > 0 || viewedCount > 0) {
           draftDataRef.current = data;
           setDraftBanner({
@@ -204,10 +254,23 @@ export function useCodeAnnotationDraft({
         }
         hasMountedRef.current = true;
       })
-      .catch(() => {
-        hasMountedRef.current = true;
+      .catch((error) => {
+        if (!cancelled && seq === switchSeqRef.current) {
+          reportTargetChanged(error, seq);
+          hasMountedRef.current = true;
+        }
       });
+    return () => { cancelled = true; };
   }, [isApiMode]);
+
+  useEffect(() => {
+    const data = draftDataRef.current;
+    if (!data) return;
+    const count = (data.codeAnnotations?.length ?? 0)
+      + (data.descriptionAnnotations?.length ?? 0) + (data.commentAnnotations?.length ?? 0);
+    const viewedCount = persistViewedFiles ? data.viewedFiles?.length ?? 0 : 0;
+    setDraftBanner(count || viewedCount ? { count, viewedCount, timeAgo: formatTimeAgo(data.ts || 0) } : null);
+  }, [persistViewedFiles]);
 
   // Debounced auto-save on annotation/viewed changes
   useEffect(() => {
@@ -223,7 +286,7 @@ export function useCodeAnnotationDraft({
     //     via `allAnnotations` and have their own lifecycle, separate from the draft.
     if (annotations.some((a) => !a.source) || descriptionAnnotations.length > 0 || commentAnnotations.length > 0) hasHadAnnotationsRef.current = true;
 
-    const isEmpty = annotations.length === 0 && descriptionAnnotations.length === 0 && commentAnnotations.length === 0 && viewedFiles.size === 0;
+    const isEmpty = annotations.length === 0 && descriptionAnnotations.length === 0 && commentAnnotations.length === 0 && (!persistViewedFiles || viewedFiles.size === 0);
     // Leave the server alone for an empty state until the user has actually had
     // annotations this session. This preserves an unrestored draft sitting on disk
     // at mount (the draft-recovery banner can still offer it).
@@ -231,7 +294,9 @@ export function useCodeAnnotationDraft({
 
     if (timerRef.current) clearTimeout(timerRef.current);
 
-    timerRef.current = setTimeout(() => {
+    const seq = switchSeqRef.current;
+    const persist = async () => {
+      if (targetChangedRef.current) return;
       // The switched-onto target's draft is still loading: writing now would
       // overwrite it unread. Settling the load re-runs this effect.
       if (awaitingTargetLoadRef.current) {
@@ -251,7 +316,7 @@ export function useCodeAnnotationDraft({
         // tombstone so it can't resurface on refresh and a late save can't revive
         // it. Mirrors useAnnotationDraft.persistNow — routed through the draft
         // transport seam so a host backend tombstones its own stored draft too.
-        getDraftTransport().remove(draftGeneration, { keepalive: false }).catch(() => {});
+        await transport.remove(draftGeneration, { keepalive: false });
         return;
       }
 
@@ -259,26 +324,72 @@ export function useCodeAnnotationDraft({
         codeAnnotations: annotations,
         descriptionAnnotations,
         commentAnnotations,
-        viewedFiles: [...viewedFiles],
-        ...(autoViewSuppressed && autoViewSuppressed.size > 0
+        ...(persistViewedFiles ? { viewedFiles: [...viewedFiles] } : {}),
+        ...(persistViewedFiles && autoViewSuppressed && autoViewSuppressed.size > 0
           ? { autoViewSuppressed: [...autoViewSuppressed] }
           : {}),
         draftGeneration,
         ts: Date.now(),
       };
 
-      getDraftTransport().save(payload, { keepalive: false }).catch(() => {});
+      await transport.save(payload, { keepalive: false });
+    };
+    const save = async () => {
+      try { await persist(); } catch (error) {
+        reportTargetChanged(error, seq);
+        throw error;
+      }
+    };
+    pendingSaveRef.current = save;
+    timerRef.current = setTimeout(() => {
+      if (switchPausedRef.current) return;
+      pendingSaveRef.current = null;
+      savingRef.current = save();
+      savingRef.current.catch(() => {});
     }, DEBOUNCE_MS);
 
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
+      const waiting = pendingSaveRef.current === save;
+      pendingSaveRef.current = null;
+      // The host unmounted with this save still waiting for the pause (a render error took the review's place):
+      // send it now rather than drop it. A change of what is saved also runs this cleanup; it leaves the host mounted.
+      if (waiting) queueMicrotask(() => {
+        if (!mountedRef.current && !switchPausedRef.current) save().catch(() => {});
+      });
     };
-  }, [annotations, descriptionAnnotations, commentAnnotations, viewedFiles, autoViewSuppressed, isApiMode, submitted, saveNudge]);
+  }, [annotations, descriptionAnnotations, commentAnnotations, viewedFiles, autoViewSuppressed, isApiMode, submitted, saveNudge, persistViewedFiles, transport]);
+
+  // A failure box's Reload (ui's RegionBoundary) sends the save waiting for the pause first.
+  useEffect(() => flushBeforeReload(async () => {
+    if (switchPausedRef.current) return;
+    if (timerRef.current) clearTimeout(timerRef.current);
+    await savingRef.current?.catch(() => {});
+    const pending = pendingSaveRef.current;
+    pendingSaveRef.current = null;
+    if (pending) await pending().catch(() => {});
+  }), []);
+
+  const flushBeforeSwitch = useCallback(async () => {
+    switchPausedRef.current = true;
+    if (timerRef.current) clearTimeout(timerRef.current);
+    try {
+      // Persistence is best-effort: a rejected earlier write must neither
+      // block navigation nor skip a newer edit still waiting on debounce.
+      await savingRef.current?.catch(() => {});
+      const pending = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      if (pending) await pending().catch(() => {});
+    } finally {
+      savingRef.current = null;
+    }
+  }, []);
 
   const restoreDraft = useCallback(() => {
     // Cancel any pending autosave so it can't fire with pre-restore state and
     // overwrite what we're about to restore.
     if (timerRef.current) clearTimeout(timerRef.current);
+    pendingSaveRef.current = null;
     const data = draftDataRef.current;
     setDraftBanner(null);
     draftDataRef.current = null;
@@ -286,9 +397,9 @@ export function useCodeAnnotationDraft({
       annotations: data?.codeAnnotations ?? [],
       descriptionAnnotations: data?.descriptionAnnotations ?? [],
       commentAnnotations: data?.commentAnnotations ?? [],
-      viewedFiles: data?.viewedFiles ?? [],
-      autoViewSuppressed: data?.autoViewSuppressed ?? [],
       patchChanged: data?.patchChanged === true,
+      viewedFiles: persistViewedRef.current ? data?.viewedFiles ?? [] : [],
+      autoViewSuppressed: persistViewedRef.current ? data?.autoViewSuppressed ?? [] : [],
     };
   }, []);
 
@@ -298,19 +409,43 @@ export function useCodeAnnotationDraft({
     // Cancel any pending autosave so a late save can't revive the draft the user
     // just dismissed.
     if (timerRef.current) clearTimeout(timerRef.current);
+    pendingSaveRef.current = null;
     const deletedGeneration = draftGenerationRef.current + 1;
     draftGenerationRef.current = deletedGeneration;
     setDraftBanner(null);
     draftDataRef.current = null;
-    getDraftTransport().remove(deletedGeneration, { keepalive: false }).catch(() => {});
+    const seq = switchSeqRef.current;
+    transportRef.current.remove(deletedGeneration, { keepalive: false }).catch(error => {
+      reportTargetChanged(error, seq);
+    });
   }, []);
 
   // Unmount supersedes any in-flight target read, so a retry never fires
   // after the page (or a test host) is gone.
   useEffect(() => () => { switchSeqRef.current += 1; }, []);
 
-  const adoptDraftTarget = useCallback((state: CodeDraftTargetState | undefined) => {
+  const adoptDraftTarget = useCallback((state: CodeDraftTargetState | undefined, nextTransport?: DraftTransport) => {
     if (!isApiMode) return;
+    // undefined also resumes a FAILED switch, which has not repaired a
+    // target mismatch. Only an applied server response may clear the notice.
+    if (state) {
+      targetChangedRef.current = false;
+      setDraftTargetChanged(false);
+    }
+    if (switchPausedRef.current) {
+      switchPausedRef.current = false;
+      setSaveNudge(n => n + 1);
+    }
+    // A failed/superseded request did not adopt another target. Its current
+    // draft may still be loading (or unreadable); retain that write protection.
+    if (!state) return;
+    // An applied switch supersedes the page-load read (its seq guard drops
+    // the result), so it must open autosave itself. A failed/superseded
+    // switch must not: the page-load read may still be in flight, and
+    // saving before it settles could overwrite a draft the banner has not
+    // offered yet.
+    hasMountedRef.current = true;
+    const targetTransport = nextTransport ?? transportRef.current;
     // Every switch starts clean: a previous switch's load (if still in
     // flight) is superseded, an unreadable-target block is lifted, and any
     // write either of them held back resumes (under the new target).
@@ -324,7 +459,6 @@ export function useCodeAnnotationDraft({
     awaitingTargetLoadRef.current = false;
     targetUnreadableRef.current = false;
     retryTargetLoadRef.current = null;
-    if (!state) { resumeHeldWrite(); return; }
     const floor = readDraftGeneration(state.draftGeneration);
     if (floor !== null) draftGenerationRef.current = Math.max(draftGenerationRef.current, floor);
     if (!state.found) { resumeHeldWrite(); return; }
@@ -364,7 +498,7 @@ export function useCodeAnnotationDraft({
       awaitingTargetLoadRef.current = true;
       const attempt = (remaining: number): void => {
         if (switchSeqRef.current !== seq) return; // superseded or unmounted
-        withTimeout(getDraftTransport().load(), loadTimeoutRef.current)
+        withTimeout(targetTransport.load(), loadTimeoutRef.current)
           .then(({ data, generation }) => {
             if (switchSeqRef.current !== seq) return; // a newer switch owns the keys now
             // A debounced save armed before the read settled captured the
@@ -379,8 +513,12 @@ export function useCodeAnnotationDraft({
             targetUnreadableRef.current = false;
             resumeHeldWrite();
           })
-          .catch(() => {
+          .catch((error) => {
             if (switchSeqRef.current !== seq) return;
+            if (reportTargetChanged(error, seq)) {
+              awaitingTargetLoadRef.current = false;
+              return;
+            }
             if (remaining > 0) { attempt(remaining - 1); return; }
             // Still unreadable: never overwrite it blind. Autosave keeps
             // running for the session and retries this read on its next
@@ -395,5 +533,5 @@ export function useCodeAnnotationDraft({
     read();
   }, [isApiMode]);
 
-  return { draftBanner, restoreDraft, getDraftGeneration, dismissDraft, adoptDraftTarget };
+  return { draftBanner, draftTargetChanged, restoreDraft, getDraftGeneration, dismissDraft, adoptDraftTarget, flushBeforeSwitch };
 }

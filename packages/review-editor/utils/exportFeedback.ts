@@ -1,8 +1,21 @@
-import type { CodeAnnotation, ConventionalLabel, ConventionalDecoration, CommentAnnotation, Annotation, ArtifactAnnotationMeta } from '@plannotator/ui/types';
+import type { CodeAnnotation, ConventionalLabel, ConventionalDecoration, CommentAnnotation, Annotation, ArtifactAnnotationMeta, MarkdownPreviewAnchor } from '@plannotator/ui/types';
 import type { PRMetadata } from '@plannotator/shared/pr-types';
 import { getMRLabel, getMRNumberLabel, getDisplayRepo } from '@plannotator/shared/pr-types';
 import { exportAnnotations, parseMarkdownToBlocks } from '@plannotator/ui/utils/parser';
 import { artifactAnchorLabel } from './artifactAnnotations';
+import { codeFenceFor } from '@plannotator/core/markdown-structure';
+import { attachedLines } from '@plannotator/ui/utils/attachedLines';
+
+/**
+ * Quoted code in a fence longer than any backtick run in it (CommonMark), so
+ * a ``` line in the code can never close the quote early. Unchanged (three
+ * backticks) for code without such a run. The Inbox's guideCommentEntry
+ * writes the same (packages/inbox/guideFeedback.test.ts keeps them equal).
+ */
+function fenced(code: string): string {
+  const fence = codeFenceFor(code);
+  return `${fence}\n${code}\n${fence}\n`;
+}
 
 /**
  * Format a conventional comment prefix per the Conventional Comments spec:
@@ -85,11 +98,11 @@ function describeDiff(ctx: FeedbackDiffContext): string {
     case "jj-current":   label = "Current change"; break;
     case "jj-last":      label = "Last change"; break;
     case "jj-line":      label = base ? `Line of work vs \`${base}\`` : "Line of work"; break;
-    case "jj-all":       label = "All files"; break;
+    case "jj-all":       label = "Every file"; break;
     case "since-base":   label = base ? `All changes since \`${base}\` (committed + uncommitted + untracked)` : "All changes since base (committed + uncommitted + untracked)"; break;
     case "branch":       label = base ? `Branch diff vs \`${base}\`` : "Branch diff"; break;
     case "merge-base":   label = base ? `Committed changes vs \`${base}\`` : "Committed changes"; break;
-    case "all":          label = "All files"; break;
+    case "all":          label = "Every file"; break;
     default:             label = mode; // p4-* or anything else — show raw
   }
   return worktreePath ? `${label} _(worktree: ${worktreePath})_` : label;
@@ -134,6 +147,18 @@ function outdatedNote(ann: CodeAnnotation): string {
   return ann.outdated ? `${OUTDATED_ANNOTATION_LABEL}\n` : '';
 }
 
+/** The heading suffix of a comment on lines outside the diff (a file the
+ *  review does not change, or a changed file's lines outside its hunks). */
+export const OUTSIDE_DIFF_ANNOTATION_LABEL = '(not in the diff)';
+
+/** A comment outside the diff carries the code it was written on, fenced, so
+ *  the agent reads it without the diff around it. */
+function outsideDiffCodeBlock(ann: CodeAnnotation): string {
+  if (!ann.outsideDiff) return '';
+  const code = ann.anchorText ?? ann.originalCode;
+  return code ? `\n**Code:**\n${fenced(code)}` : '';
+}
+
 function gitButlerMismatchNote(ann: CodeAnnotation, current?: FeedbackDiffContext): string {
   if (!ann.gitButlerDiffType) return '';
   const sameSnapshot = !ann.gitButlerSnapshotId || ann.gitButlerSnapshotId === current?.snapshotId;
@@ -173,6 +198,26 @@ export function formatCallFlowAnnotationTargets(annotation: CodeAnnotation): str
   return `\n\n**Selected call-flow steps:**\n${rows.join('\n')}`;
 }
 
+const MARKDOWN_PREVIEW_CONTEXT_LABEL: Record<NonNullable<MarkdownPreviewAnchor['diffContext']>, string> = {
+  added: 'in added text',
+  removed: 'in removed text',
+  modified: 'in changed text',
+  unchanged: 'in unchanged text',
+};
+
+/**
+ * The quoted text of a comment made in a Markdown file's rendered preview,
+ * as a Markdown quote, plus where in the rendered diff it was when that says
+ * something (removed text no longer exists in the file).
+ */
+export function markdownPreviewQuote(anchor: MarkdownPreviewAnchor): string {
+  const quote = anchor.originalText.trim().split('\n').map((line) => `> ${line}`).join('\n');
+  const where = anchor.diffContext && anchor.diffContext !== 'unchanged'
+    ? `\n_(${MARKDOWN_PREVIEW_CONTEXT_LABEL[anchor.diffContext]})_`
+    : '';
+  return `${quote}${where}\n`;
+}
+
 function formatFileAnnotations(fileAnnotations: CodeAnnotation[], headingLevel = '###', currentDiff?: FeedbackDiffContext): string {
   let output = '';
 
@@ -189,6 +234,18 @@ function formatFileAnnotations(fileAnnotations: CodeAnnotation[], headingLevel =
     const scope = ann.scope ?? 'line';
     const prefix = formatConventionalPrefix(ann.conventionalLabel, ann.decorations);
 
+    if (scope === 'file' && ann.markdownPreview) {
+      output += `${headingLevel} Comment on the rendered Markdown\n`;
+      output += commitMismatchNote(ann, commitShaFromMode(currentDiff?.mode));
+      output += gitButlerMismatchNote(ann, currentDiff);
+      output += `${markdownPreviewQuote(ann.markdownPreview)}\n`;
+      if (ann.text) output += `${prefix}${ann.text}\n`;
+      else if (prefix) output += `${prefix.trimEnd()}\n`;
+      output += attachedLines(ann.images);
+      output += '\n';
+      continue;
+    }
+
     if (scope === 'file') {
       output += `${headingLevel} File Comment\n`;
       output += commitMismatchNote(ann, commitShaFromMode(currentDiff?.mode));
@@ -200,6 +257,7 @@ function formatFileAnnotations(fileAnnotations: CodeAnnotation[], headingLevel =
       }
       output += formatCallFlowAnnotationTargets(ann);
       output += formatSuggestionBlocks(ann);
+      output += attachedLines(ann.images);
       output += '\n';
       continue;
     }
@@ -210,7 +268,7 @@ function formatFileAnnotations(fileAnnotations: CodeAnnotation[], headingLevel =
     const tokenSuffix = ann.tokenText
       ? ` — \`\`${ann.tokenText.replace(/`/g, '\\`')}\`\`${ann.charStart != null ? ` (chars ${ann.charStart}-${ann.charEnd})` : ''}`
       : '';
-    output += `${headingLevel} ${lineRange} (${ann.side})${tokenSuffix}\n`;
+    output += `${headingLevel} ${lineRange} (${ann.side})${tokenSuffix}${ann.outsideDiff ? ` ${OUTSIDE_DIFF_ANNOTATION_LABEL}` : ''}\n`;
     output += outdatedNote(ann);
     output += commitMismatchNote(ann, commitShaFromMode(currentDiff?.mode));
     output += gitButlerMismatchNote(ann, currentDiff);
@@ -225,7 +283,10 @@ function formatFileAnnotations(fileAnnotations: CodeAnnotation[], headingLevel =
     }
     output += formatCallFlowAnnotationTargets(ann);
     output += formatSelectedTextBlock(ann);
-    output += formatSuggestionBlocks(ann);
+    output += outsideDiffCodeBlock(ann);
+    // The code block already quotes the lines; a suggestion still shows what it replaces.
+    output += ann.outsideDiff && !ann.suggestedCode ? '' : formatSuggestionBlocks(ann);
+    output += attachedLines(ann.images);
     output += '\n';
   }
 
@@ -245,7 +306,7 @@ function formatSelectedTextBlock(ann: CodeAnnotation): string {
   if (ann.selectedTextFromEdits) {
     output += `_The highlighted text below includes the reviewer's in-progress edits; the line range above anchors to the current file lines that region replaces (approximate)._\n`;
   }
-  output += `\n**Highlighted text:**\n\`\`\`\n${ann.selectedText}\n\`\`\`\n`;
+  output += `\n**Highlighted text:**\n${fenced(ann.selectedText)}`;
   return output;
 }
 
@@ -263,16 +324,24 @@ function formatSelectedTextBlock(ann: CodeAnnotation): string {
 function formatSuggestionBlocks(ann: CodeAnnotation): string {
   let output = '';
   if ((ann.suggestedCode || ann.text) && ann.originalCode) {
-    output += `\n**Replaces:**\n\`\`\`\n${ann.originalCode}\n\`\`\`\n`;
+    output += `\n**Replaces:**\n${fenced(ann.originalCode)}`;
   }
   if (ann.suggestedCode) {
-    output += `\n**Suggested code:**\n\`\`\`\n${ann.suggestedCode}\n\`\`\`\n`;
+    output += `\n**Suggested code:**\n${fenced(ann.suggestedCode)}`;
   }
   return output;
 }
 
+/**
+ * The heading review-level comments (`scope: 'general'`, the "Global comment"
+ * button, a decision's note) go under, ahead of the per-file sections. The
+ * Inbox's guided-review export writes the same (GUIDE_GLOBAL_COMMENTS_HEADING,
+ * kept equal by packages/inbox/guideFeedback.test.ts).
+ */
+export const GLOBAL_COMMENTS_HEADING = 'Global comments';
+
 function renderGeneralComments(annotations: CodeAnnotation[]): string {
-  let output = '## General\n\n';
+  let output = `## ${GLOBAL_COMMENTS_HEADING}\n\n`;
   for (const ann of annotations) {
     const prefix = formatConventionalPrefix(ann.conventionalLabel, ann.decorations);
     if (ann.text) {
@@ -342,8 +411,8 @@ export function exportReviewFeedback(
     return '# Code Review\n\nNo feedback provided.';
   }
 
-  // General (review-level) comments belong to no file — render them in their own
-  // section and group only the rest by file.
+  // Global (review-level) comments belong to no file — render them in their own
+  // section, first, and group only the rest by file.
   const general = annotations.filter(a => (a.scope ?? 'line') === 'general');
   const placed = annotations.filter(a => (a.scope ?? 'line') !== 'general');
   const generalSection = general.length > 0 ? renderGeneralComments(general) : '';
@@ -366,13 +435,14 @@ export function exportReviewFeedback(
         `${prMeta.url}\n\n`
       : `# Code Review Feedback\n\n${diffContext ? `**Diff:** ${describeDiff(diffContext)}\n\n` : ''}`;
 
-    output += renderScopedGroups(placed, '##', diffContext);
     output += generalSection;
+    output += renderScopedGroups(placed, '##', diffContext);
     return output;
   }
 
   // Multi-PR: group by prUrl, then by file within each
   let output = isMultiPR ? '# Multi-PR Review\n\n' : '# Code Review\n\n';
+  output += generalSection;
 
   const byPR = new Map<string, CodeAnnotation[]>();
   for (const ann of placed) {
@@ -401,7 +471,6 @@ export function exportReviewFeedback(
     output += renderScopedGroups(prAnnotations, '###');
   }
 
-  output += generalSection;
   return output;
 }
 

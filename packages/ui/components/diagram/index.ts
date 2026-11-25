@@ -6,12 +6,12 @@
  * `graphviz`, `mermaid`, `diagram-anchor`, `diagram-anchor-graphviz`,
  * `diagram-projection`).
  */
-export { DiagramViewer, type DiagramViewerProps } from './DiagramViewer';
+export { DiagramViewer, type DiagramAskAI, type DiagramHostDraft, type DiagramViewerProps } from './DiagramViewer';
 export { DiagramPopout } from './DiagramPopout';
 export { DiagramPending, DiagramInlineSource, DiagramBlockPending } from './DiagramPending';
 export { isDiagramControlEvent, DIAGRAM_CONTROL_SELECTOR } from './diagramControls';
 export { svgContentSize } from './svgContentSize';
-export { DiagramCanvas, KEY_PAN_PX, type DiagramCanvasHandle, type DiagramEscapeOutcome } from './DiagramCanvas';
+export { DiagramCanvas, KEY_PAN_PX, type DiagramCanvasHandle, type DiagramEscapeOutcome, type DiagramWheelZoom } from './DiagramCanvas';
 export { DiagramOverlay } from './DiagramOverlay';
 export { DiagramComposer } from './DiagramComposer';
 export { DiagramSourcePane } from './DiagramSourcePane';
@@ -24,6 +24,7 @@ export {
   type ResolvedDiagramComment,
 } from './useDiagramComments';
 export { useDiagramRender, type DiagramRenderState } from './useDiagramRender';
+export { DiagramSvgAcceptContext } from '../diagramSvgAccept';
 export { useDiagramSourceDraft, PREVIEW_DEBOUNCE_MS, type DiagramSourceDraft, type SaveResult } from './useDiagramSourceDraft';
 export {
   useDiagramViewport,

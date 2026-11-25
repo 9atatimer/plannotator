@@ -13,6 +13,10 @@ import {
   buildServeArgs,
   buildServeOffArgs,
   checkServeStatusPort,
+  createTailscaleRunner,
+  MAC_TAILSCALE_APP_CLI,
+  serveStatusProxy,
+  tailscaleAppFallback,
   describeTailscaleFailure,
   detectTailnetHost,
   extractServeHttpsUrl,
@@ -101,9 +105,9 @@ describe("detectTailnetHost", () => {
     expect("error" in result && result.error).toContain("not found on PATH");
   });
 
-  test("reports a not-signed-in daemon via stderr detail", () => {
+  test("reports a not-signed-in daemon in plain words", () => {
     const result = detectTailnetHost(() => ({ status: 1, stdout: "", stderr: "Logged out." }));
-    expect("error" in result && result.error).toContain("Logged out.");
+    expect("error" in result && result.error).toContain("signed out on this computer");
   });
 
   test("errors when neither DNSName nor a single IPv4 is available", () => {
@@ -119,6 +123,125 @@ describe("describeTailscaleFailure", () => {
       "tailscale up",
     );
   });
+
+  // Tailscale's own words (cmd/tailscale/cli isRunningOrStarting, the local
+  // client's connect error, serve's enable prompt) -> the plain next step.
+  const failed = (stderr: string, stdout = "") => describeTailscaleFailure({ status: 1, stdout, stderr });
+
+  test("Serve off for the tailnet without a link points at the admin console", () => {
+    const text = failed("", "Serve is not enabled on your tailnet.\n");
+    expect(text).toContain("Tailscale setting, not a Plannotator bug");
+    expect(text).toContain("https://login.tailscale.com/admin/dns");
+  });
+
+  test("signed out: passes on Tailscale's login link when it gave one", () => {
+    expect(failed("Logged out.\nLog in at: https://login.tailscale.com/a/xyz\n")).toContain("Sign in at https://login.tailscale.com/a/xyz");
+    expect(failed("Logged out.\n")).toContain("signed out on this computer");
+  });
+
+  test("stopped, not running, and waiting for approval each name their fix", () => {
+    expect(failed("Tailscale is stopped.\n")).toContain("turned off on this computer");
+    expect(
+      failed("Failed to connect to local Tailscale daemon for /localapi/v0/serve-config; not running? Error: dial unix /var/run/tailscaled.socket: connect: no such file or directory\n"),
+    ).toContain("not running on this computer");
+    expect(failed("Machine is not yet approved by tailnet admin.\n")).toContain("waiting for approval");
+  });
+
+  test("anything else still shows Tailscale's own text", () => {
+    expect(failed("error enabling https feature: some control error\n")).toContain("error enabling https feature: some control error");
+  });
+});
+
+// A Mac with the Tailscale app but without its command-line tool turned on
+// has no `tailscale` on PATH; the app's own program is the CLI when run by its
+// real path. The spawn, the platform and the existence check are injected, so
+// nothing here runs a real tailscale or looks at the real /Applications.
+describe("the Mac app's CLI when `tailscale` is not on PATH", () => {
+  const enoent = (): TailscaleRunResult => ({
+    error: Object.assign(new Error("spawnSync tailscale ENOENT"), { code: "ENOENT" }),
+    status: null,
+    stdout: "",
+    stderr: "",
+  });
+  const world = (onPath: TailscaleRunResult, fromApp: TailscaleRunResult = ok("1.104.4\n")) => {
+    const calls: { command: string; args: string[]; timeoutMs: number }[] = [];
+    const envs: Record<string, string | undefined>[] = [];
+    const spawn = (command: string, args: string[], timeoutMs: number, env: Record<string, string | undefined>) => {
+      calls.push({ command, args, timeoutMs });
+      envs.push(env);
+      return command === "tailscale" ? onPath : fromApp;
+    };
+    return { calls, envs, spawn };
+  };
+  const mac = { platform: "darwin" as const, exists: (path: string) => path === MAC_TAILSCALE_APP_CLI, env: {} };
+
+  test("PATH without tailscale and the app installed: runs the app's CLI by its real path, same args and timeout", () => {
+    const { calls, spawn } = world(enoent());
+    const result = createTailscaleRunner(spawn, mac)(["serve", "status", "--json"], 3_000);
+    expect(result).toEqual(ok("1.104.4\n"));
+    // The path is pinned on purpose: the app's program works as the CLI only by this real path (a symlink crashes it).
+    expect(calls).toEqual([
+      { command: "tailscale", args: ["serve", "status", "--json"], timeoutMs: 3_000 },
+      { command: "/Applications/Tailscale.app/Contents/MacOS/Tailscale", args: ["serve", "status", "--json"], timeoutMs: 3_000 },
+    ]);
+  });
+
+  test("neither on PATH nor the app: the not-found failure, which names both fixes", () => {
+    const { calls, spawn } = world(enoent());
+    const result = createTailscaleRunner(spawn, { ...mac, exists: () => false })(["version"], 3_000);
+    expect(calls.map((call) => call.command)).toEqual(["tailscale"]);
+    const text = describeTailscaleFailure(result);
+    expect(text).toContain("not found on PATH");
+    expect(text).toContain("Install CLI");
+    expect(text).toContain("https://tailscale.com/download");
+  });
+
+  test("not on macOS: no fallback, even where that path would exist", () => {
+    for (const platform of ["linux", "win32"] as const) {
+      const { calls, spawn } = world(enoent());
+      const result = createTailscaleRunner(spawn, { ...mac, platform, exists: () => true })(["version"], 3_000);
+      expect(calls.map((call) => call.command)).toEqual(["tailscale"]);
+      expect((result.error as NodeJS.ErrnoException).code).toBe("ENOENT");
+    }
+  });
+
+  test("PATH comes first: a tailscale on PATH, failing or not, is never second-guessed", () => {
+    for (const onPath of [ok("{}"), { status: 1, stdout: "", stderr: "Logged out." }]) {
+      const { calls, spawn } = world(onPath);
+      expect(createTailscaleRunner(spawn, mac)(["status", "--json"], 3_000)).toEqual(onPath);
+      expect(calls.map((call) => call.command)).toEqual(["tailscale"]);
+    }
+  });
+
+  // The app's program acts as a CLI only with SHLVL or a non-empty TERM set;
+  // an Inbox started without a terminal (the Claude app, launchd) has neither.
+  test("the app's CLI gets SHLVL when the parent has none; the PATH spawn's env and a parent's own SHLVL are kept", () => {
+    const parent = { PATH: "/usr/bin:/bin", HOME: "/Users/someone" };
+    const { envs, spawn } = world(enoent());
+    createTailscaleRunner(spawn, mac, () => ({ ...parent }))(["version"], 3_000);
+    expect(envs[0]).toEqual(parent);
+    expect(envs[1]).toEqual({ ...parent, SHLVL: "1" });
+
+    for (const [given, expected] of [["", "1"], ["3", "3"]] as const) {
+      const run = world(enoent());
+      createTailscaleRunner(run.spawn, mac, () => ({ ...parent, SHLVL: given }))(["version"], 3_000);
+      expect(run.envs[1]!.SHLVL).toBe(expected);
+    }
+  });
+
+  test("the app printing that its GUI failed to start (exit 0) is a failure in plain words, not unparseable JSON", () => {
+    const gui = { status: 0, stdout: "", stderr: "The Tailscale GUI failed to start: The operation couldn’t be completed. (Tailscale.CLIError error 3.)\n" };
+    const { spawn } = world(enoent(), gui);
+    const result = createTailscaleRunner(spawn, mac, () => ({}))(["serve", "status", "--json"], 3_000);
+    expect(result.error).toBeDefined();
+    expect(describeTailscaleFailure(result)).toContain("Install CLI");
+    expect(detectTailnetHost(createTailscaleRunner(spawn, mac, () => ({})))).toEqual({ error: describeTailscaleFailure(result) });
+  });
+
+  test("a test run (PLANNOTATOR_TEST_SANDBOX) never reaches the real app", () => {
+    expect(tailscaleAppFallback(enoent(), { ...mac, env: { PLANNOTATOR_TEST_SANDBOX: "/tmp/x" } })).toBeUndefined();
+    expect(tailscaleAppFallback(enoent(), mac)).toBe(MAC_TAILSCALE_APP_CLI);
+  });
 });
 
 describe("serve command construction", () => {
@@ -132,6 +255,33 @@ describe("serve command construction", () => {
       "http://127.0.0.1:19432",
     ]);
     expect(buildServeOffArgs(19432)).toEqual(["serve", "--https=19432", "off"]);
+  });
+
+  test("the Inbox's two-port form: a stable tailnet HTTPS port in front of this run's loopback port", () => {
+    expect(buildServeArgs(52817, 8443)).toEqual(["serve", "--bg", "--https=8443", "http://127.0.0.1:52817"]);
+  });
+});
+
+describe("serveStatusProxy", () => {
+  // The shape `tailscale serve status --json` printed on a Mac (1.9x) with a 443 mapping and the Inbox's 8443.
+  const status = JSON.stringify({
+    TCP: { "443": { HTTPS: true }, "8443": { HTTPS: true } },
+    Web: {
+      "macbook.tail0000.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:5274" } } },
+      "macbook.tail0000.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:52817" } } },
+    },
+  });
+
+  test("names the proxy target of the mapping on a port, so a caller can tell its own from another's", () => {
+    expect(serveStatusProxy(status, 8443)).toEqual({ state: "mapped", proxy: "http://127.0.0.1:52817" });
+    expect(serveStatusProxy(status, 443)).toEqual({ state: "mapped", proxy: "http://127.0.0.1:5274" });
+    expect(serveStatusProxy(status, 9443)).toEqual({ state: "free" });
+    expect(serveStatusProxy("null", 8443)).toEqual({ state: "free" });
+    expect(serveStatusProxy("not json", 8443)).toEqual({ state: "malformed" });
+  });
+
+  test("a mapping with no proxy handler (a TCP forward) reads as someone else's", () => {
+    expect(serveStatusProxy(JSON.stringify({ TCP: { "8443": { TCPForward: "127.0.0.1:22" } } }), 8443)).toEqual({ state: "mapped", proxy: "" });
   });
 });
 

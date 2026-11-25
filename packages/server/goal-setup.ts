@@ -6,7 +6,8 @@
  * launch a browser session, wait, and receive a structured JSON result.
  */
 
-import { appHtmlResponse, likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
+import { likelyAppHtmlEncoding, prewarmAppHtml } from "@plannotator/shared/app-html";
+import { openPackedApp, packedAppResponse } from "@plannotator/shared/packed-app";
 import type { Origin } from "@plannotator/shared/agents";
 import {
   createFactsResult,
@@ -17,14 +18,20 @@ import {
   type GoalSetupResult,
 } from "@plannotator/shared/goal-setup";
 import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort, buildAdvertisedUrl } from "./remote";
+import { createRequestHostGuard } from "./request-host-guard";
+import { withPlannotatorServerHeader } from "./plannotator-server-marker";
+import { refuseCrossOriginWrite } from "./request-origin-guard";
 import { getRepoInfo } from "./repo";
 import {
+  handleCustomThemesScript,
+  customThemesPage,
   handleFavicon,
   handleImage,
   handleServerReady,
   handleUpload,
 } from "./shared-handlers";
-import { detectGitUser, getServerConfig, saveConfig } from "./config";
+import { detectGitUser, getServerConfig, parseDisplayOptionsConfig, saveConfig } from "./config";
+import { agentToolHostForServer } from "./ai-runtime";
 import { isFaviconStyle, type FaviconStyle } from "@plannotator/shared/favicon";
 import { isWSL } from "./browser";
 
@@ -79,6 +86,7 @@ export async function startGoalSetupServer(
 ): Promise<GoalSetupServerResult> {
   const { bundle, htmlContent, origin = "claude-code", onReady } = options;
   const isRemote = isRemoteSession();
+  const app = openPackedApp(htmlContent, { page: (html) => customThemesPage(html) });
   const wslFlag = await isWSL();
   const repoInfo = await getRepoInfo();
   const gitUser = detectGitUser();
@@ -101,14 +109,22 @@ export async function startGoalSetupServer(
     resolveDecision(result);
   };
 
+  const requestHostGuard = createRequestHostGuard();
   const server = await startBunServerOnAvailablePort((port) =>
-    Bun.serve({
+    Bun.serve(withPlannotatorServerHeader({
         hostname: getServerHostname(),
         port,
         // Bun's default 10s idleTimeout kills long-running requests.
         idleTimeout: 0,
 
         async fetch(req) {
+          // Host allowlist first, before any route (request-host-guard.ts).
+          const hostRefusal = requestHostGuard.check(req);
+          if (hostRefusal) return hostRefusal;
+          // Then no write from another site, before any route (request-origin-guard.ts).
+          const originRefusal = refuseCrossOriginWrite(req);
+          if (originRefusal) return originRefusal;
+
           const url = new URL(req.url);
 
           if (
@@ -124,7 +140,7 @@ export async function startGoalSetupServer(
               repoInfo,
               projectRoot: process.cwd(),
               isWSL: wslFlag,
-              serverConfig: getServerConfig(gitUser),
+              serverConfig: getServerConfig(gitUser, agentToolHostForServer()),
               sharingEnabled: false,
             });
           }
@@ -134,6 +150,7 @@ export async function startGoalSetupServer(
               const body = (await req.json()) as {
                 displayName?: string;
                 diffOptions?: Record<string, unknown>;
+                displayOptions?: unknown;
                 theme?: Record<string, unknown>;
                 favicon?: FaviconStyle;
                 conventionalComments?: boolean;
@@ -145,6 +162,13 @@ export async function startGoalSetupServer(
               }
               if (body.diffOptions !== undefined) {
                 toSave.diffOptions = body.diffOptions;
+              }
+              if (body.displayOptions !== undefined) {
+                const displayOptions = parseDisplayOptionsConfig(body.displayOptions);
+                if (!displayOptions) {
+                  return Response.json({ error: "Invalid displayOptions" }, { status: 400 });
+                }
+                toSave.displayOptions = displayOptions;
               }
               if (body.theme !== undefined) {
                 toSave.theme = body.theme;
@@ -158,8 +182,8 @@ export async function startGoalSetupServer(
               if (body.conventionalLabels !== undefined) {
                 toSave.conventionalLabels = body.conventionalLabels;
               }
-              if (Object.keys(toSave).length > 0) {
-                saveConfig(toSave as Parameters<typeof saveConfig>[0]);
+              if (Object.keys(toSave).length > 0 && !saveConfig(toSave as Parameters<typeof saveConfig>[0])) {
+                return Response.json({ error: "config.json could not be saved; nothing changed. A config.json that is not valid JSON is never written over: fix or remove it." }, { status: 500 });
               }
               return Response.json({ ok: true });
             } catch {
@@ -196,9 +220,10 @@ export async function startGoalSetupServer(
             return Response.json({ ok: true });
           }
 
-          if (url.pathname === "/favicon.png") return handleFavicon();
+          if (url.pathname === "/favicon.png" || url.pathname === "/favicon.ico") return handleFavicon(url.pathname);
+          if (url.pathname === "/plannotator-themes.js" && req.method === "GET") return handleCustomThemesScript(url.searchParams);
 
-          return appHtmlResponse(req, htmlContent, isRemote);
+          return packedAppResponse(app, req, url.pathname, isRemote);
         },
 
         error(err) {
@@ -208,14 +233,14 @@ export async function startGoalSetupServer(
             { status: 500, headers: { "Content-Type": "text/plain" } }
           );
         },
-    }),
+    })),
   );
 
   const port = server.port!;
   const serverUrl = buildAdvertisedUrl(port);
   // Remote sessions serve the app page compressed (#1617); start the likely
   // encoding (gzip over plain http) now so the first load does not wait.
-  if (isRemote) prewarmAppHtml(htmlContent, likelyAppHtmlEncoding(false));
+  if (isRemote) prewarmAppHtml(app.page(), likelyAppHtmlEncoding(false));
   onReady?.(serverUrl, isRemote, port);
 
   return {

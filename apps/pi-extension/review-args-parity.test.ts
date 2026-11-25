@@ -34,6 +34,29 @@ describe("vendored review-args parity", () => {
     expect(parsed.errors).toEqual([]);
   });
 
+  test("the vendored resolver treats path-shaped prose as prose but keeps a sole typo fatal", async () => {
+    // Pi's /plannotator-review passes raw words; a stale vendor would refuse
+    // "look at the api/users code" instead of reviewing the cwd (v0.27.23).
+    const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { parseReviewArgs, resolveReviewTarget } = await import("./generated/review-args.ts");
+    const root = mkdtempSync(join(tmpdir(), "pi-review-target-"));
+    try {
+      mkdirSync(join(root, "backend"));
+      writeFileSync(join(root, "notes.txt"), "x");
+      const target = (input: string) => resolveReviewTarget(parseReviewArgs(input), root);
+      expect(target("look at the api/users code").directory).toBeUndefined();
+      expect(target("look at ./notes.txt please").ignored).toContain("./notes.txt");
+      expect(target("look at ./backend please").directory).toBe(join(root, "backend"));
+      expect(() => target("./backnd")).toThrow("Did you mean ./backend? Run: plannotator review ./backend");
+      expect(() => target("backnd")).toThrow(`No folder "backnd" in ${root}; nothing was opened.`);
+      expect(() => target("./notes.txt")).toThrow("is a file, not a folder");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("the vendored open-state validator applies the provider matrix", async () => {
     // Guards the vendor.sh entry for review-open-state: without it Pi's
     // review command would crash on import instead of validating.

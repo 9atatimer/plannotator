@@ -1,9 +1,14 @@
 ---
 import ModeToggleIsland from './ModeToggleIsland.tsx';
+import { INBOX_LAUNCHED } from '../lib/inbox-launch';
 
 const currentPath = Astro.url.pathname;
 const isDocsActive = currentPath.startsWith('/docs/');
 const isBlogActive = currentPath.startsWith('/blog/');
+// On the /inbox/ pages the bar also links the supported agents page.
+const isInboxSection = currentPath.startsWith('/inbox/');
+const isAgentsActive = currentPath.startsWith('/inbox/agents/');
+const isInboxActive = isInboxSection;
 const isWorkspacesActive = currentPath.startsWith('/workspaces/');
 ---
 <nav class="fixed top-0 left-0 right-0 h-12 flex items-center justify-between px-4 sm:px-6 bg-background/80 backdrop-blur-sm border-b border-border/30 z-50">
@@ -34,6 +39,35 @@ const isWorkspacesActive = currentPath.startsWith('/workspaces/');
         Blog
       </a>
       <span class="text-muted-foreground/50">|</span>
+      {INBOX_LAUNCHED && (
+        <Fragment>
+          <a
+            href="/inbox/"
+            class:list={[
+              'transition-colors',
+              isInboxActive ? 'text-foreground font-medium' : 'text-muted-foreground hover:text-foreground',
+            ]}
+          >
+            Inbox
+          </a>
+          <span class="text-muted-foreground/50">|</span>
+          {isInboxSection && (
+            <Fragment>
+              {/* Wide screens only: a phone's bar has room for Workspaces or this, and Workspaces stays. */}
+              <a
+                href="/inbox/agents/"
+                class:list={[
+                  'transition-colors hidden sm:inline',
+                  isAgentsActive ? 'text-foreground font-medium' : 'text-muted-foreground hover:text-foreground',
+                ]}
+              >
+                Supported agents
+              </a>
+              <span class="text-muted-foreground/50 hidden sm:inline">|</span>
+            </Fragment>
+          )}
+        </Fragment>
+      )}
       <a
         href="/workspaces/"
         class:list={[

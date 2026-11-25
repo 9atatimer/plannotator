@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import type {
+  ForgejoPRMetadata,
   GithubPRMetadata,
+  BitbucketPRMetadata,
   GitlabMRMetadata,
   PRContext,
 } from '@plannotator/shared/pr-types';
@@ -53,6 +55,33 @@ const emptyContext: PRContext = {
 };
 
 describe('buildPRArtifacts', () => {
+  it('collects nothing on a platform without the artifacts capability (Bitbucket)', () => {
+    const bitbucketMetadata: BitbucketPRMetadata = {
+      platform: 'bitbucket',
+      host: 'bitbucket.org',
+      workspace: 'acme',
+      repo: 'widgets',
+      number: 42,
+      title: 'Improve widgets',
+      author: 'bb-user',
+      baseBranch: 'main',
+      headBranch: 'better-widgets',
+      baseSha: 'base',
+      headSha: 'head',
+      url: 'https://bitbucket.org/acme/widgets/pull-requests/42',
+    };
+    const context: PRContext = {
+      ...emptyContext,
+      body: [
+        '![hosted](https://bitbucket.org/repo/abc123/images/1234-shot.png)',
+        `![shot](${SHOT_URL})`,
+      ].join('\n\n'),
+    };
+    // Control: the same description yields an artifact on GitHub.
+    expect(buildPRArtifacts(githubMetadata, context).length).toBeGreaterThan(0);
+    expect(buildPRArtifacts(bitbucketMetadata, context)).toEqual([]);
+  });
+
   it('harvests supported markdown and raw HTML attachments but ignores ordinary links and code', () => {
     const context: PRContext = {
       ...emptyContext,
@@ -290,5 +319,65 @@ describe('buildPRArtifacts', () => {
         body: `![local image](${SHOT_URL})`,
       }),
     ).toEqual([]);
+  });
+});
+
+describe('buildPRArtifacts on Forgejo', () => {
+  const forgejoMetadata: ForgejoPRMetadata = {
+    platform: 'forgejo',
+    host: 'forgejo.example.com',
+    owner: 'acme',
+    repo: 'widgets',
+    number: 5,
+    title: 'Improve widgets',
+    author: 'reviewer',
+    baseBranch: 'main',
+    headBranch: 'better-widgets',
+    baseSha: 'base',
+    headSha: 'head',
+    url: 'https://forgejo.example.com/acme/widgets/pulls/5',
+  };
+  const uuid = '0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d';
+  const otherUuid = 'ffffffff-4f50-4a6b-8c7d-9e0f1a2b3c4d';
+
+  it('finds the relative upload links Forgejo\'s editor writes, typed by the link text', () => {
+    // The editor writes /attachments/<uuid>: no extension, so the name carries the type.
+    const context: PRContext = {
+      ...emptyContext,
+      body: [
+        `![screenshot.png](/attachments/${uuid})`,
+        `[demo.webm](/acme/widgets/attachments/${otherUuid})`,
+        '[ordinary link](https://example.com/docs)',
+      ].join('\n\n'),
+    };
+    const artifacts = buildPRArtifacts(forgejoMetadata, context);
+    expect(artifacts.map((artifact) => [artifact.kind, artifact.name])).toEqual([
+      ['image', 'screenshot.png'],
+      ['video', 'demo.webm'],
+    ]);
+  });
+
+  it('counts one upload once even when it is also linked absolutely', () => {
+    const context: PRContext = {
+      ...emptyContext,
+      body: [`![a.png](/attachments/${uuid})`, `![b.png](https://forgejo.example.com/attachments/${uuid})`].join('\n\n'),
+    };
+    expect(buildPRArtifacts(forgejoMetadata, context)).toHaveLength(1);
+  });
+
+  it('collects nothing from an upload on another host', () => {
+    const context: PRContext = {
+      ...emptyContext,
+      body: `![a.png](https://elsewhere.example.com/attachments/${uuid})`,
+    };
+    expect(buildPRArtifacts(forgejoMetadata, context)).toEqual([]);
+  });
+
+  it('counts one upload once however its query string differs', () => {
+    const context: PRContext = {
+      ...emptyContext,
+      body: [`![a.png](/attachments/${uuid}?x=1)`, `![a.png](/attachments/${uuid}?x=2)`].join('\n\n'),
+    };
+    expect(buildPRArtifacts(forgejoMetadata, context)).toHaveLength(1);
   });
 });

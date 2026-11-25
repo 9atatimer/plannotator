@@ -1,0 +1,557 @@
+/**
+ * The drawing rules: what an agent's HTML drawing may hold, and the checks on
+ * it. Once Shape's board format; kept for what still takes a drawing: a guided
+ * review's html diagram (core `checkInboxDrawing`, submit_guide), and the
+ * `path#L42` code places a `:::note` anchor and a drawing's `data-code` name.
+ *
+ * Browser-safe and dependency-free.
+ *
+ *  - `checkShapeDrawnView` checks one drawing (`{ html, css?, width?, height?,
+ *    tall?, more? }`) and names the exact field that is wrong.
+ *  - `parseShapeCodeTarget` reads a code place (`src/a.ts#L42-L48`).
+ *  - `isShapeProjectPath` says whether a path is a plain path in a project.
+ */
+
+/**
+ * A drawn view (Picture, How it works): HTML and inline SVG the agent writes,
+ * drawn in its own style scope.
+ *
+ *  - `data-step="N"`: parts with the same N arrive together, in number order.
+ *    A `path` or `line` with `class="draw"` and `pathLength="1"` draws on.
+ *  - `data-mark="id"`: a part the person can point at (Change it / Ask). Keep
+ *    the id across versions for the same part.
+ *  - `data-ref="n"`: an empty element that becomes reference bubble n.
+ *  - Colours come from the frame's variables (`--ink`, `--paper`, `--mark`,
+ *    `--grey`, `--rule`), so light and dark both work.
+ */
+export interface ShapeDrawnView {
+  html: string;
+  /** Rules for this view only (scoped to it). No `@import`, no outside `url()`. */
+  css?: string;
+  /**
+   * A fixed canvas, in CSS pixels, that the board scales to fit. Absent: the
+   * HTML flows like a page.
+   */
+  width?: number;
+  height?: number;
+  /** A stacked drawing for a narrow board (a phone), shown below 700 px. */
+  tall?: { html: string; css?: string };
+  /**
+   * The Picture only: a fuller drawing behind the board's "Show more", when there is more
+   * that must be drawn. It flows and scrolls like a page. Most boards have none.
+   */
+  more?: { html: string; css?: string };
+}
+
+// ───────────────────────────── limits ─────────────────────────────
+
+/** The most a drawing may hold. A refusal names the field and the limit. */
+export const SHAPE_LIMITS = {
+  title: 140,
+  html: 300_000,
+  css: 60_000,
+  canvas: { min: 200, max: 4000 },
+} as const;
+
+// ───────────────────────────── validation ─────────────────────────────
+
+export type ShapeCheck<T> = { ok: true; value: T } | { ok: false; errors: string[] };
+
+// ─── what a drawing may load: only what it holds ───
+//
+// Checked when the agent sends the drawing, so it hears at once which field is wrong.
+
+/**
+ * Tags a drawing may not hold. `animate` and `set` can rewrite an href after
+ * the sanitizer; `dialog` and `select` (its picker) open in the top layer,
+ * over the whole app, past the frame's containment and clip.
+ */
+// `area` and `map`: an image map's `<area href>` is a link the board's guard would have to know too; a drawing has `<a>`.
+const FORBIDDEN_TAGS = ['script', 'iframe', 'frame', 'object', 'embed', 'link', 'meta', 'base', 'form', 'style', 'template', 'portal', 'source', 'animate', 'set', 'animatemotion', 'animatetransform', 'dialog', 'select', 'area', 'map'];
+export const SHAPE_FORBIDDEN_TAGS: readonly string[] = FORBIDDEN_TAGS;
+
+/** Attributes that lift a part into the top layer (a popover, a modal), over the app: dropped. */
+export const SHAPE_TOP_LAYER_ATTRS: readonly string[] = ['popover', 'popovertarget', 'popovertargetaction', 'command', 'commandfor', 'interestfor', 'interesttarget'];
+
+/** Attributes that load something and have no safe use on a board: dropped. */
+export const SHAPE_DROPPED_ATTRS: readonly string[] = ['srcset', 'imagesrcset', 'poster', 'ping', 'lowsrc', 'dynsrc', 'longdesc'];
+
+/** Attributes that hold a URL: each must pass `shapeUrlAllowed`. */
+export const SHAPE_URL_ATTRS: readonly string[] = ['src', 'href', 'xlink:href', 'action', 'formaction', 'background', 'data', 'cite', 'codebase', 'manifest', 'icon', 'usemap', 'profile', 'archive', 'classid'];
+
+/** A URL as a URL parser reads it: the parser drops tabs and newlines anywhere, so `ht\ttps:` is `https:`. */
+function urlKey(value: string): string {
+  return value.replace(/[\u0000-\u0020\u007f]/g, '').toLowerCase();
+}
+
+const DATA_IMAGE_RE = /^data:image\/(?:png|jpeg|gif|webp)[;,]/;
+/** A file the board keeps: `files/<name>`, one name (the store's own rule: no folder, no dot first) and no escapes. */
+const BOARD_FILE_RE = /^files\/[^/\\%?#.][^/\\%?#]*$/;
+
+/**
+ * May a drawing's URL attribute hold this value? Only what the board holds:
+ * `files/<name>`, `#fragment`, or a `data:image/` PNG, JPEG, GIF or WebP. A
+ * link (`<a href>`) may also point out, over https. Anything else (another
+ * scheme, `//host`, `\\host`, `https:host`, a path) is refused.
+ */
+export function shapeUrlAllowed(value: string, link = false): boolean {
+  const key = urlKey(value);
+  if (key.startsWith('#') || DATA_IMAGE_RE.test(key) || BOARD_FILE_RE.test(key)) return true;
+  if (!link || !key.startsWith('https://')) return false;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === 'https:' && !!url.hostname;
+  } catch {
+    return false;
+  }
+}
+
+function codePoint(hex: string): string {
+  const n = parseInt(hex, 16);
+  return n > 0 && n <= 0x10ffff && (n < 0xd800 || n > 0xdfff) ? String.fromCodePoint(n) : '\ufffd';
+}
+
+/**
+ * CSS without its comments. A `/*` inside a string is text, not a comment,
+ * so strings are stepped over (with their escapes) while comments go.
+ */
+function stripCssComments(css: string): string {
+  let out = '';
+  let quote: string | null = null;
+  for (let i = 0; i < css.length; i++) {
+    const ch = css[i]!;
+    if (ch === '\\') {
+      out += css.slice(i, i + 2);
+      i++;
+    } else if (quote) {
+      out += ch;
+      if (ch === quote || ch === '\n') quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+    } else if (ch === '/' && css[i + 1] === '*') {
+      const end = css.indexOf('*/', i + 2);
+      i = end < 0 ? css.length : end + 1;
+    } else out += ch;
+  }
+  return out;
+}
+
+/**
+ * CSS as its tokenizer reads it: escapes read (`u\72l(` is `url(`), lower
+ * case, and comments gone outside strings. `keepComments` reads it with them
+ * left in, a second look the checks also take, so no comment reading of ours
+ * can hide a url.
+ */
+function cssKey(css: string, keepComments = false): string {
+  return (keepComments ? css : stripCssComments(css))
+    .replace(/\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\n\r\f])?|(\r\n|[\n\r\f])|([\s\S]))/g, (_, hex?: string, _nl?: string, ch?: string) =>
+      hex ? codePoint(hex) : ch ?? '',
+    )
+    .toLowerCase();
+}
+
+/** The values a CSS text hands to `url(…)`, read as a URL parser reads them. */
+function cssUrls(key: string): string[] {
+  return [...key.matchAll(/url\s*\(\s*["']?([^)"']*)/g)].map((m) => urlKey(m[1] ?? ''));
+}
+
+/**
+ * What a view's CSS (or a `style` attribute) may not hold: imports, fonts,
+ * scripted CSS and anything that loads from outside. `url()` may name only a
+ * `#fragment` or a data:image. Escapes and comments are read first.
+ */
+export function shapeCssProblems(css: string): string[] {
+  const out: string[] = [];
+  const keys = [cssKey(css), cssKey(css, true)];
+  const any = (test: (key: string) => boolean) => keys.some(test);
+  if (any((k) => /@import/.test(k))) out.push('@import is not allowed');
+  if (any((k) => /@font-face/.test(k))) out.push('@font-face is not allowed');
+  if (any((k) => /image-set\s*\(/.test(k))) out.push('image-set() is not allowed; use url() with a data:image');
+  if (any((k) => /(?:^|[^\w-])src\s*\(/.test(k))) out.push('src() is not allowed; use url() with a data:image');
+  if (any((k) => cssUrls(k).some((u) => !u.startsWith('#') && !DATA_IMAGE_RE.test(u)))) out.push('url() may name only a #fragment or a data:image (png, jpeg, gif, webp)');
+  if (any((k) => /expression\s*\(|-moz-binding|behavior\s*:/.test(k))) out.push('scripted CSS is not allowed');
+  // A customizable select's picker opens in the top layer, over the app.
+  if (any((k) => /base-select|::?picker\s*\(/.test(k))) out.push('a select picker (base-select, ::picker) is not allowed');
+  if (/<\/style/i.test(css)) out.push('</style> is not allowed');
+  return out;
+}
+
+/**
+ * A presentation attribute (`fill`, `mask`, `filter`, `clip-path`,
+ * `marker-*`…) may use `url(#id)` and nothing else that loads.
+ */
+export function shapePaintAllowed(value: string): boolean {
+  return [cssKey(value), cssKey(value, true)].every(
+    (key) => !/image-set\s*\(|(?:^|[^\w-])src\s*\(/.test(key) && cssUrls(key).every((u) => u.startsWith('#')),
+  );
+}
+
+/** Attributes that only ever hold words. */
+const TEXT_ATTRS = new Set(['title', 'alt', 'class', 'id', 'role', 'lang', 'dir']);
+
+/**
+ * The tags in HTML as `/<([a-zA-Z][\w:-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g`
+ * finds them, in order: each tag's name and the text between the name and
+ * its `>`. A quote opens a value that runs to the same quote, so a `>` in it
+ * does not close the tag; a tag whose quote or `>` never comes is no tag.
+ *
+ * That regex scans to the end of the input from every `<` that is never
+ * closed, which is quadratic. This reads it in one pass instead: one
+ * backward pass finds, for every place a tag's text could go on from, where
+ * that tag would close (or that it never does).
+ */
+export function shapeHtmlTags(html: string): { name: string; attrs: string }[] {
+  const n = html.length;
+  // close[i]: the `>` a tag's text, read from i outside any quote, ends at; -1 for none.
+  const close = new Int32Array(n + 1);
+  close[n] = -1;
+  let nextDouble = -1;
+  let nextSingle = -1;
+  for (let i = n - 1; i >= 0; i--) {
+    const c = html.charCodeAt(i);
+    if (c === 62 /* > */) close[i] = i;
+    else if (c === 34 /* " */) {
+      close[i] = nextDouble < 0 ? -1 : close[nextDouble + 1]!;
+      nextDouble = i;
+    } else if (c === 39 /* ' */) {
+      close[i] = nextSingle < 0 ? -1 : close[nextSingle + 1]!;
+      nextSingle = i;
+    } else close[i] = close[i + 1]!;
+  }
+  const tags: { name: string; attrs: string }[] = [];
+  for (let lt = html.indexOf('<'); lt >= 0; ) {
+    if (!/[a-zA-Z]/.test(html[lt + 1] ?? '')) {
+      lt = html.indexOf('<', lt + 1);
+      continue;
+    }
+    let end = lt + 2;
+    while (end < n && /[\w:-]/.test(html[end]!)) end++;
+    const gt = close[end]!;
+    if (gt < 0) {
+      // Not a tag; a later `<` inside it still may be one, as the regex finds.
+      lt = html.indexOf('<', lt + 1);
+      continue;
+    }
+    tags.push({ name: html.slice(lt + 1, end), attrs: html.slice(end, gt) });
+    lt = html.indexOf('<', gt + 1);
+  }
+  return tags;
+}
+
+/**
+ * Whether some tag in HTML holds an event handler, as
+ * `/<[^>]*\son[a-z]+\s*=/i` finds one: from a `<` up to the next `>` (or the
+ * end), with no regard for quotes. Each stretch is read once, from its first
+ * `<`, where that regex reads it again from every `<`.
+ */
+export function shapeHtmlHasEventHandler(html: string): boolean {
+  for (let lt = html.indexOf('<'); lt >= 0; ) {
+    const gt = html.indexOf('>', lt + 1);
+    if (/\son[a-z]+\s*=/i.test(html.slice(lt + 1, gt < 0 ? html.length : gt))) return true;
+    if (gt < 0) return false;
+    lt = html.indexOf('<', gt + 1);
+  }
+  return false;
+}
+
+const ATTR_RE = /([^\s"'=<>/`]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+
+/**
+ * What a drawn view's HTML may not hold: scripts, event handlers, and anything
+ * that loads from outside the board. The board sanitizes again when it draws;
+ * this refusal tells the agent at once, by field.
+ */
+export function shapeHtmlProblems(html: string): string[] {
+  const out: string[] = [];
+  const add = (p: string) => {
+    if (!out.includes(p)) out.push(p);
+  };
+  const lower = html.toLowerCase();
+  for (const tag of FORBIDDEN_TAGS) {
+    if (new RegExp(`<${tag}[\\s>/]`).test(lower)) {
+      add(
+        tag === 'style'
+          ? '<style> is not allowed here; put rules in the view\'s css'
+          : tag === 'dialog' || tag === 'select'
+            ? `<${tag}> is not allowed (it opens over the whole app); draw it`
+            : `<${tag}> is not allowed`,
+      );
+    }
+  }
+  if (shapeHtmlHasEventHandler(html)) add('event handler attributes (on…=) are not allowed');
+  if (/javascript\s*:/i.test(html)) add('javascript: URLs are not allowed');
+  for (const t of shapeHtmlTags(html)) {
+    const tag = t.name.toLowerCase();
+    const attrs = [...t.attrs.matchAll(ATTR_RE)].map((a) => ({ name: a[1]!.toLowerCase(), raw: a[2] ?? a[3] ?? a[4] ?? '' }));
+    if (tag === 'input' && attrs.some((a) => a.name === 'type' && decodeEntities(a.raw).trim().toLowerCase() === 'image')) add('<input type="image"> is not allowed');
+    for (const { name, raw } of attrs) {
+      if (name.startsWith('data-') || name.startsWith('aria-') || name.startsWith('on') || TEXT_ATTRS.has(name)) continue;
+      const value = decodeEntities(raw);
+      const shown = value.slice(0, 80);
+      const checked = name === 'style' || SHAPE_URL_ATTRS.includes(name) || /url|image-set|src|\\/i.test(value);
+      // A named character reference this check cannot read (`&colon;`) could hide a scheme or a `(`.
+      if (checked && /&[a-z][a-z0-9]*;/i.test(value)) {
+        add(`${tag} ${name}: write characters plainly, not as named references like &colon;`);
+        continue;
+      }
+      if (SHAPE_TOP_LAYER_ATTRS.includes(name)) add(`${name} is not allowed (it lifts a part over the whole app)`);
+      else if (SHAPE_DROPPED_ATTRS.includes(name)) add(`${name} is not allowed (it loads from outside the board); use one src`);
+      else if (SHAPE_URL_ATTRS.includes(name)) {
+        const link = tag === 'a' && (name === 'href' || name === 'xlink:href');
+        if (!shapeUrlAllowed(value, link)) {
+          add(`<${tag} ${name}="${shown}">: nothing may load from outside the board; use files/<name>, #id or a data:image (a picture on this computer or the web goes in <img src> or <image href>, and shape update copies it in)${link ? ' (a link may be https://)' : ''}`);
+        }
+      } else if (name === 'style') {
+        for (const p of shapeCssProblems(value)) add(`<${tag} style>: ${p}`);
+      } else if (!shapePaintAllowed(value)) add(`<${tag} ${name}="${shown}">: only url(#id) is allowed here`);
+    }
+  }
+  for (const value of shapeHtmlDataCodes(html)) {
+    if (!parseShapeCodeTarget(value)) add(`data-code="${value.slice(0, 80)}" is not a file and line in the project (write path#L42)`);
+  }
+  return out;
+}
+
+const isHtmlSpace = (c: string | undefined) => c === ' ' || c === '\t' || c === '\n' || c === '\f' || c === '\r';
+const isAsciiAlpha = (c: string | undefined) => !!c && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'));
+/** A value longer than this is no file and line; it is kept cut, with a mark, so it still fails as one. */
+const DATA_CODE_READ_MAX = 512;
+
+/**
+ * For each place in `html`, the next place at or after it whose character
+ * `stop` takes (`html.length` when none): one pass from the end, so every jump
+ * in the scan below costs one step.
+ */
+function nextWhere(html: string, stop: (c: string) => boolean): Int32Array {
+  const n = html.length;
+  const next = new Int32Array(n + 2).fill(n);
+  for (let i = n - 1; i >= 0; i--) next[i] = stop(html[i]!) ? i : next[i + 1]!;
+  return next;
+}
+
+/**
+ * Every `data-code` value a browser could read in drawn HTML, and maybe more:
+ * the check that uses it must never miss a code the board draws, and a code
+ * it reads that the board does not draw only makes the check stricter. So it
+ * reads a start tag at every `<` followed by a letter, wherever it stands:
+ * in text, in a comment, in the content of script, style, textarea, title,
+ * noscript and the like, in a CDATA section, inside another tag's attribute.
+ * Where a browser starts a tag, it reads it from there by the tokenizer's own
+ * rules (a value quoted or not, a stray quote inside an unquoted one kept, an
+ * attribute after `/` or straight after another's closing quote), and those
+ * rules do not depend on what is around the tag, so whatever the parser and
+ * the sanitizer make of the rest (scripting on or off, svg and math, a
+ * misnested end tag), a code the board draws was written here as such a tag.
+ * Named references decoded; in order. Linear: a scan that comes to an
+ * attribute another scan already read stops, as the rest is the same.
+ */
+export function shapeHtmlDataCodes(html: string): string[] {
+  const out: string[] = [];
+  const n = html.length;
+  if (!html.includes('<')) return out;
+  const tagNameEnd = nextWhere(html, (c) => isHtmlSpace(c) || c === '/' || c === '>');
+  const attrNameEnd = nextWhere(html, (c) => isHtmlSpace(c) || c === '/' || c === '>' || c === '=');
+  const unquotedEnd = nextWhere(html, (c) => isHtmlSpace(c) || c === '>');
+  const nextDouble = nextWhere(html, (c) => c === '"');
+  const nextSingle = nextWhere(html, (c) => c === "'");
+  const nextSolid = nextWhere(html, (c) => !isHtmlSpace(c));
+  const nextAttr = nextWhere(html, (c) => !isHtmlSpace(c) && c !== '/');
+  const read = new Uint8Array(n + 1);
+  for (let lt = html.indexOf('<'); lt >= 0; lt = html.indexOf('<', lt + 1)) {
+    if (!isAsciiAlpha(html[lt + 1])) continue;
+    let i = tagNameEnd[lt + 1]!;
+    for (;;) {
+      i = nextAttr[i]!;
+      if (i >= n || html[i] === '>' || read[i]) break;
+      read[i] = 1;
+      const nameEnd = attrNameEnd[i + 1]!; // A name may start with `=`.
+      const isCode = nameEnd - i === 9 && html.slice(i, nameEnd).toLowerCase() === 'data-code';
+      i = nextSolid[nameEnd]!;
+      if (html[i] !== '=') continue;
+      i = nextSolid[i + 1]!;
+      let from = i;
+      let to: number;
+      if (html[i] === '"' || html[i] === "'") {
+        from = i + 1;
+        to = (html[i] === '"' ? nextDouble : nextSingle)[from]!;
+        i = Math.min(to + 1, n);
+      } else {
+        to = unquotedEnd[i]!;
+        i = to;
+      }
+      if (isCode) out.push(to - from > DATA_CODE_READ_MAX ? `${decodeEntities(html.slice(from, from + DATA_CODE_READ_MAX))}…` : decodeEntities(html.slice(from, to)));
+    }
+  }
+  return out;
+}
+
+/**
+ * A path in the project, relative to its root: `src/a.ts`. Not absolute
+ * (`/x`, `C:/x`, `~/x`), no `.` or `..` part, no backslash (a UNC path or a
+ * Windows `..\`), no `%` escape, no URL scheme and no control character.
+ */
+export function isShapeProjectPath(path: string): boolean {
+  if (!path || path.length > 500 || path !== path.trim()) return false;
+  if (/[\u0000-\u001f\u007f\\%]/.test(path)) return false;
+  if (path.startsWith('/') || path.startsWith('~') || /^[a-z][a-z0-9+.-]*:/i.test(path)) return false;
+  return path.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+class Checker {
+  errors: string[] = [];
+  fail(field: string, message: string) {
+    this.errors.push(`${field}: ${message}`);
+  }
+  text(value: unknown, field: string, max: number, required = true): string | undefined {
+    if (value === undefined || value === null) {
+      if (required) this.fail(field, 'is required');
+      return undefined;
+    }
+    if (typeof value !== 'string') {
+      this.fail(field, 'must be a string');
+      return undefined;
+    }
+    if (required && !value.trim()) {
+      this.fail(field, 'is empty');
+      return undefined;
+    }
+    if (value.length > max) {
+      this.fail(field, `is ${value.length} characters; at most ${max}`);
+      return undefined;
+    }
+    return value;
+  }
+  int(value: unknown, field: string, min: number, max: number, required = true): number | undefined {
+    if (value === undefined || value === null) {
+      if (required) this.fail(field, 'is required');
+      return undefined;
+    }
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+      this.fail(field, `must be a whole number from ${min} to ${max}`);
+      return undefined;
+    }
+    return value;
+  }
+}
+
+function checkDrawn(c: Checker, value: unknown, field: string): ShapeDrawnView | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value)) {
+    c.fail(field, 'must be an object with html');
+    return undefined;
+  }
+  const html = c.text(value.html, `${field}.html`, SHAPE_LIMITS.html);
+  if (html !== undefined) for (const p of shapeHtmlProblems(html)) c.fail(`${field}.html`, p);
+  const css = c.text(value.css, `${field}.css`, SHAPE_LIMITS.css, false);
+  if (css !== undefined) for (const p of shapeCssProblems(css)) c.fail(`${field}.css`, p);
+  const width = c.int(value.width, `${field}.width`, SHAPE_LIMITS.canvas.min, SHAPE_LIMITS.canvas.max, false);
+  const height = c.int(value.height, `${field}.height`, SHAPE_LIMITS.canvas.min, SHAPE_LIMITS.canvas.max, false);
+  if ((width === undefined) !== (height === undefined) && !c.errors.some((e) => e.startsWith(`${field}.width`) || e.startsWith(`${field}.height`))) {
+    c.fail(field, 'width and height go together (a fixed canvas), or neither');
+  }
+  let tall: ShapeDrawnView['tall'];
+  if (value.tall !== undefined && value.tall !== null) {
+    if (!isRecord(value.tall)) c.fail(`${field}.tall`, 'must be an object with html');
+    else {
+      const th = c.text(value.tall.html, `${field}.tall.html`, SHAPE_LIMITS.html);
+      if (th !== undefined) for (const p of shapeHtmlProblems(th)) c.fail(`${field}.tall.html`, p);
+      const tc = c.text(value.tall.css, `${field}.tall.css`, SHAPE_LIMITS.css, false);
+      if (tc !== undefined) for (const p of shapeCssProblems(tc)) c.fail(`${field}.tall.css`, p);
+      if (th !== undefined) tall = { html: th, ...(tc ? { css: tc } : {}) };
+    }
+  }
+  if (value.examples !== undefined && value.examples !== null) {
+    c.fail(`${field}.examples`, 'examples go on views.how (How it works), the drawing they are followed through');
+  }
+  let more: ShapeDrawnView['more'];
+  if (value.more !== undefined && value.more !== null) {
+    if (!isRecord(value.more)) c.fail(`${field}.more`, 'must be an object with html');
+    else {
+      const mh = c.text(value.more.html, `${field}.more.html`, SHAPE_LIMITS.html);
+      if (mh !== undefined) for (const p of shapeHtmlProblems(mh)) c.fail(`${field}.more.html`, p);
+      const mc = c.text(value.more.css, `${field}.more.css`, SHAPE_LIMITS.css, false);
+      if (mc !== undefined) for (const p of shapeCssProblems(mc)) c.fail(`${field}.more.css`, p);
+      if (mh !== undefined) more = { html: mh, ...(mc ? { css: mc } : {}) };
+    }
+  }
+  if (html === undefined) return undefined;
+  return {
+    html,
+    ...(css ? { css } : {}),
+    ...(width !== undefined && height !== undefined ? { width, height } : {}),
+    ...(tall ? { tall } : {}),
+    ...(more ? { more } : {}),
+  };
+}
+
+/**
+ * One drawn view on its own, as another surface takes it (code review's
+ * pictures): `{ html, css?, width?, height?, tall? }`, with the checks a
+ * drawing gets. Each problem names its field under `field`.
+ */
+export function checkShapeDrawnView(input: unknown, field = 'view'): ShapeCheck<ShapeDrawnView> {
+  const c = new Checker();
+  if (!isRecord(input)) return { ok: false, errors: [`${field}: must be an object with html`] };
+  const view = checkDrawn(c, input, field);
+  if (c.errors.length || !view) return { ok: false, errors: c.errors.length ? c.errors : [`${field}.html: is required`] };
+  return { ok: true, value: view };
+}
+
+// ───────────────────────────── entities ─────────────────────────────
+
+/** The named references read here; any other stays as written (and a check that cares refuses it). */
+const NAMED_REFS: Readonly<Record<string, string>> = { nbsp: '\u00a0', lt: '<', LT: '<', gt: '>', GT: '>', quot: '"', QUOT: '"', apos: "'", amp: '&', AMP: '&', rarr: '→' };
+
+/**
+ * Character references decoded once, as a browser does (`&#38;#x2F;` is
+ * `&#x2F;`, not `/`): numeric ones with or without their `;`, the named ones
+ * above; and a NULL is U+FFFD, as a browser reads it in an attribute. A
+ * numeric one in 128–159 is the windows-1252 character, as a browser reads it
+ * (`&#150;` is an en dash, not a C1 control).
+ */
+function decodeEntities(text: string): string {
+  return text
+    .replace(/\0/g, '\ufffd')
+    .replace(/&(?:#(\d+);?|#[xX]([0-9a-fA-F]+);?|([A-Za-z][A-Za-z0-9]*);)/g, (whole, d: string | undefined, h: string | undefined, name: string | undefined) =>
+      d !== undefined ? numericRef(Number(d).toString(16)) : h !== undefined ? numericRef(h) : (NAMED_REFS[name!] ?? whole),
+    );
+}
+
+/** 128–159 as windows-1252 (the HTML standard's table; the five it leaves out stay as they are). */
+const WINDOWS_1252_C1 = '\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160\u2039\u0152\u008d\u017d\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u0161\u203a\u0153\u009d\u017e\u0178';
+
+function numericRef(hex: string): string {
+  const n = parseInt(hex, 16);
+  return n >= 0x80 && n <= 0x9f ? WINDOWS_1252_C1[n - 0x80]! : codePoint(hex);
+}
+
+// ───────────────────────────── code places ─────────────────────────────
+
+/** A place in code a drawn part points at. */
+export interface ShapeCodeTarget {
+  path: string;
+  line: number;
+  lineEnd?: number;
+}
+
+/**
+ * Reads a part's `data-code` ("src/snooze.ts#L42", "src/snooze.ts#L42-L48"
+ * or "src/snooze.ts:42"). Null when it is not one: a path outside the
+ * project (`isShapeProjectPath`: absolute, `..`, a backslash), a URL or no line.
+ */
+export function parseShapeCodeTarget(value: string | null | undefined): ShapeCodeTarget | null {
+  const m = (value ?? '').trim().match(/^([^#:\s][^#:]*?)(?:#L(\d+)(?:-L?(\d+))?|:(\d+)(?:-(\d+))?)$/);
+  if (!m) return null;
+  const path = m[1]!;
+  if (!isShapeProjectPath(path)) return null;
+  const line = Number(m[2] ?? m[4]);
+  const end = m[3] ?? m[5];
+  if (!Number.isSafeInteger(line) || line < 1) return null;
+  const lineEnd = end ? Number(end) : undefined;
+  return lineEnd && lineEnd > line ? { path, line, lineEnd } : { path, line };
+}

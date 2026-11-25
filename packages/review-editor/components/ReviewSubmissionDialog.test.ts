@@ -103,6 +103,31 @@ describe('buildPRActionRequest', () => {
     });
   });
 
+  // #1583: Bitbucket posts the general comment after the inline ones, so it
+  // can be the piece that failed. The retry must resend THAT text (from the
+  // server), never the dialog's current textarea.
+  test('a retry that carries an unposted general comment resends exactly it', () => {
+    const partialTarget: SubmissionTarget = {
+      ...target,
+      status: 'partial',
+      partial: {
+        status: 'partial',
+        postedFileCommentCount: 2,
+        failedFileComments: [],
+        reviewBodyPosted: false,
+        approval: 'succeeded',
+        retry: { action: 'comment', fileComments: [], body: 'Server copy of the summary.' },
+      },
+    };
+
+    expect(buildPRActionRequest('request_changes', 'Edited in the dialog since', partialTarget)).toEqual({
+      action: 'comment',
+      body: 'Server copy of the summary.',
+      fileComments: [],
+      targetPrUrl: target.prUrl,
+    });
+  });
+
   test('refuses a partial target without a server-authorized retry', () => {
     expect(() => buildPRActionRequest('comment', 'Do not post', {
       ...target,
@@ -154,6 +179,15 @@ describe('Call Flow platform comments', () => {
     expect(submission.targets[0].fileComments).toHaveLength(1);
     expect(submission.targets[0].fileComments[0].body).toContain('src/order.ts:L10');
     expect(submission.targets[0].fileComments[0].body).toContain('src/events.ts:L22');
+  });
+
+  test('an old-side line outside the diff says its side and has no link: the link opens the head, where that number is another line', () => {
+    const opened = (side: 'old' | 'new'): CodeAnnotation => ({ id: side, type: 'comment', scope: 'line', filePath: 'src/order.ts', lineStart: 20, lineEnd: 20, side, text: 'Why?', outsideDiff: true, anchorText: 'const x = 1;', createdAt: 1 });
+    const body = (side: 'old' | 'new') =>
+      buildReviewSubmission([opened(side)], [], 'https://github.com/acme/widgets/pull/42', new Set(['src/order.ts']), { number: 42, title: 'T', repo: 'acme/widgets' }, undefined, 'github', () => 'https://head.example/#L20').targets[0].fileScopedBody;
+    expect(body('old')).toContain('L20, old side');
+    expect(body('old')).not.toContain('https://head.example');
+    expect(body('new')).toContain('https://head.example/#L20');
   });
 
   test('posts out-of-hunk Call Flow feedback in the review body, not as a fake inline comment', () => {
@@ -236,8 +270,8 @@ describe('file-scoped comments on GitHub (#1599)', () => {
   ];
   const paths = new Set(['src/a.ts', 'src/b.ts']);
 
-  test('GitHub posts each file comment as a file-level thread and leaves it out of the body', () => {
-    const [target] = buildReviewSubmission(annotations, [], PR_URL, paths, meta, undefined, 'github').targets;
+  test.each(['github', 'gitlab'] as const)('%s posts each file comment as a file-level thread and leaves it out of the body', (platform) => {
+    const [target] = buildReviewSubmission(annotations, [], PR_URL, paths, meta, undefined, platform).targets;
     expect(target.fileLevelComments).toEqual([
       { path: 'src/a.ts', body: 'Split this file.' },
       { path: 'src/a.ts', body: 'Wrong directory.' },
@@ -250,8 +284,8 @@ describe('file-scoped comments on GitHub (#1599)', () => {
     expect(target.fileComments).toHaveLength(0);
   });
 
-  test('GitLab and an unknown platform keep folding file comments into the body', () => {
-    for (const platform of ['gitlab', undefined] as const) {
+  test('Bitbucket and an unknown platform keep folding file comments into the body', () => {
+    for (const platform of ['bitbucket', undefined] as const) {
       const [target] = buildReviewSubmission(annotations, [], PR_URL, paths, meta, undefined, platform).targets;
       expect(target.fileLevelComments).toEqual([]);
       expect(target.fileScopedBody).toContain('**src/a.ts:** Split this file.');
@@ -287,4 +321,41 @@ describe('file-scoped comments on GitHub (#1599)', () => {
     });
     expect(retried.fileLevelComments).toBeUndefined();
   });
+});
+
+describe('comments made in a Markdown preview', () => {
+  const previewComment: CodeAnnotation = {
+    id: 'md-1',
+    type: 'comment',
+    scope: 'file',
+    filePath: 'docs/guide.md',
+    lineStart: 1,
+    lineEnd: 1,
+    side: 'new',
+    text: 'Link the installer page.',
+    createdAt: 1,
+    markdownPreview: { originalText: 'new installer', view: 'diff', diffContext: 'added' },
+  };
+
+  // The quote is rendered text, which maps to no line: never inline, never a
+  // file-level thread, always the review body with the quote.
+  for (const platform of ['github', 'gitlab', 'bitbucket'] as const) {
+    test(`go into the review body with their quote (${platform})`, () => {
+      const submission = buildReviewSubmission(
+        [previewComment],
+        [],
+        'https://example.com/pr/1',
+        new Set(['docs/guide.md']),
+        { number: 1, title: 'Docs', repo: 'acme/docs' },
+        undefined,
+        platform,
+      );
+      const target = submission.targets[0];
+      expect(target.fileComments).toEqual([]);
+      expect(target.fileLevelComments).toEqual([]);
+      expect(target.fileScopedBody).toContain('docs/guide.md');
+      expect(target.fileScopedBody).toContain('> new installer');
+      expect(target.fileScopedBody).toContain('Link the installer page.');
+    });
+  }
 });

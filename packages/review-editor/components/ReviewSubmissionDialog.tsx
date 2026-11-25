@@ -1,15 +1,16 @@
 import React, { useRef } from 'react';
 import type { CodeAnnotation } from '@plannotator/ui/types';
-import type { PRReviewAction, PRReviewFileLevelComment, PRReviewSubmissionPartial } from '@plannotator/shared/pr-types';
+import { getPRPlatformCapabilities, type Platform, type PRReviewAction, type PRReviewFileLevelComment, type PRReviewSubmissionPartial } from '@plannotator/shared/pr-types';
 import { CopyButton } from './CopyButton';
 import {
   exportReviewFeedback,
   formatCallFlowAnnotationTargets,
+  markdownPreviewQuote,
   formatConventionalPrefix,
   OUTDATED_ANNOTATION_LABEL,
 } from '../utils/exportFeedback';
 import { useCompactTouchLayout } from '@plannotator/ui/hooks/useIsMobile';
-import { canPostInline } from '../utils/codeAnnotationAnchor';
+import { canPostInline } from '@plannotator/ui/utils/codeAnnotationAnchor';
 import {
   Dialog,
   DialogContent,
@@ -40,6 +41,8 @@ export interface SubmissionTarget {
   fileScopedBody: string;
   fileCount: number;
   annotationCount: number;
+  /** Comments on lines outside the diff, posted in the review body (with code and a link). */
+  outsideDiffCount?: number;
   status: 'pending' | 'success' | 'partial' | 'failed' | 'blocked';
   error?: string;
   partial?: PRReviewSubmissionPartial;
@@ -65,7 +68,7 @@ export interface PRActionRequest {
   targetPrUrl?: string;
 }
 
-type ReviewPlatform = 'github' | 'gitlab';
+type ReviewPlatform = Platform;
 
 interface ReviewSubmissionDialogProps {
   isOpen: boolean;
@@ -77,7 +80,7 @@ interface ReviewSubmissionDialogProps {
    */
   onActionChange?: (action: 'comment' | 'request_changes') => void;
   /**
-   * Why Request changes cannot be chosen (GitLab has no such review; GitHub
+   * Why Request changes cannot be chosen (the platform has no such review, or
    * refuses it on your own PR). Set ⇒ the option renders disabled with this
    * reason under it.
    */
@@ -93,6 +96,8 @@ interface ReviewSubmissionDialogProps {
   recoveryPersistsRefresh: boolean;
   mrLabel: string;
   platformLabel: string;
+  /** The PR this goes on, when no comment target names it (the Inbox's Post). */
+  postingTo?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +106,56 @@ interface ReviewSubmissionDialogProps {
 
 // A line comment posted in the review body instead of inline: outdated (#1590),
 // or stamped on a snapshot the session knows its PR has moved past.
-const inBody = (a: CodeAnnotation, withheld: ReadonlySet<string>) => a.outdated || withheld.has(a.id);
+const inBody = (a: CodeAnnotation, withheld: ReadonlySet<string>) => a.outdated || a.outsideDiff === true || withheld.has(a.id);
+
+/** A link to a file's lines at the PR's head commit (`prBlobPermalink`). */
+/** A link to lines at the PR head the comment was made on (its own PR in a stack). */
+export type ReviewPermalink = (path: string, lineStart: number, lineEnd: number, annotation?: CodeAnnotation) => string | undefined;
+
+/** Most lines of code quoted for one comment outside the diff; the permalink shows the rest. */
+export const OUTSIDE_DIFF_QUOTE_MAX_LINES = 40;
+
+function capQuotedCode(code: string): string {
+  const lines = code.split('\n');
+  if (lines.length <= OUTSIDE_DIFF_QUOTE_MAX_LINES) return code;
+  return `${lines.slice(0, OUTSIDE_DIFF_QUOTE_MAX_LINES).join('\n')}\n…`;
+}
+
+/** The heading of the review body's section for comments on lines outside the diff. */
+export const OUTSIDE_DIFF_BODY_HEADING = 'Comments outside the diff';
+
+function codeFence(code: string): string {
+  const longest = Math.max(2, ...(code.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = '`'.repeat(longest + 1);
+  return `${fence}\n${code}\n${fence}`;
+}
+
+/**
+ * Comments on lines outside the PR's diff: no platform takes them inline, and
+ * a file outside the PR cannot take a file-level comment either, so each goes
+ * in the review body with the code it was written on and a link to those
+ * lines at the head commit.
+ */
+function buildOutsideDiffSection(annotations: CodeAnnotation[], permalink?: ReviewPermalink): string {
+  const entries = annotations
+    .filter((a) => a.outsideDiff && (a.scope ?? 'line') === 'line' && (a.text || a.suggestedCode))
+    .map((a) => {
+      // The link opens the head commit: an old side's line number is not that line there, so it goes unlinked and says its side.
+      const oldSide = a.side === 'old';
+      const lines = `${a.lineStart === a.lineEnd ? `L${a.lineStart}` : `L${a.lineStart}-L${a.lineEnd}`}${oldSide ? ', old side' : ''}`;
+      const link = oldSide ? undefined : permalink?.(a.filePath, a.lineStart, a.lineEnd, a);
+      const where = link ? `[${a.filePath} (${lines})](${link})` : `${a.filePath} (${lines})`;
+      const code = a.anchorText ?? a.originalCode;
+      // Capped (GitHub refuses a review body over 65,536 characters); the
+      // permalink covers the rest.
+      const quoted = code ? `\n\n${codeFence(capQuotedCode(code))}` : '';
+      const suggestion = a.suggestedCode ? `\n\nSuggested code:\n${codeFence(a.suggestedCode)}` : '';
+      const prefix = formatConventionalPrefix(a.conventionalLabel, a.decorations);
+      return `**${where}:** ${prefix}${a.text ?? ''}${quoted}${suggestion}`.trim();
+    });
+  if (entries.length === 0) return '';
+  return `**${OUTSIDE_DIFF_BODY_HEADING}**\n\n${entries.join('\n\n')}`;
+}
 
 function buildAnnotationFileComments(
   annotations: CodeAnnotation[],
@@ -136,7 +190,9 @@ function buildAnnotationFileComments(
 // body is the same text the review body fold uses, minus the path prefix.
 function buildFileLevelComments(annotations: CodeAnnotation[]): PRReviewFileLevelComment[] {
   return annotations
-    .filter(a => a.scope === 'file')
+    // A comment made in a Markdown preview quotes rendered text, not lines:
+    // it always rides the review body (see buildFileScopedBody).
+    .filter(a => a.scope === 'file' && !a.markdownPreview)
     .map(a => ({ path: a.filePath, body: `${a.text ?? ''}${formatCallFlowAnnotationTargets(a)}`.trim() }))
     .filter(c => c.path.length > 0 && c.body.length > 0);
 }
@@ -145,12 +201,17 @@ function buildFileLevelComments(annotations: CodeAnnotation[]): PRReviewFileLeve
 // general (review-wide) comments, which belong to no file. Both ride here so
 // neither is dropped from a PR submission. With `fileLevel` (GitHub), file-scoped
 // comments post as file-level threads instead and are left out of the body.
-function buildFileScopedBody(annotations: CodeAnnotation[], withheld: ReadonlySet<string>, fileLevel: boolean): string {
+function buildFileScopedBody(annotations: CodeAnnotation[], withheld: ReadonlySet<string>, fileLevel: boolean, permalink?: ReviewPermalink): string {
   const parts: string[] = [];
   for (const a of annotations) {
     const scope = a.scope ?? 'line';
+    if (a.outsideDiff && scope === 'line') continue; // its own section below
     const callFlowContext = formatCallFlowAnnotationTargets(a);
-    if (scope === 'file' && !fileLevel && (a.text || callFlowContext)) {
+    if (scope === 'file' && a.markdownPreview && a.text) {
+      // Never inline and never a file-level thread: the quote is rendered
+      // text, which maps to no line the platform could anchor to.
+      parts.push(`**${a.filePath} (rendered Markdown):**\n\n${markdownPreviewQuote(a.markdownPreview)}\n${a.text}`.trim());
+    } else if (scope === 'file' && !fileLevel && (a.text || callFlowContext)) {
       parts.push(`**${a.filePath}:** ${a.text ?? ''}${callFlowContext}`.trim());
     } else if (scope === 'general' && (a.text || callFlowContext)) {
       parts.push(`${a.text ?? ''}${callFlowContext}`.trim());
@@ -167,6 +228,8 @@ function buildFileScopedBody(annotations: CodeAnnotation[], withheld: ReadonlySe
       );
     }
   }
+  const outside = buildOutsideDiffSection(annotations, permalink);
+  if (outside) parts.push(outside);
   return parts.join('\n\n');
 }
 
@@ -188,6 +251,24 @@ function buildFailedCommentsMarkdown(
  * GitHub requires a body for COMMENT and REQUEST_CHANGES reviews, so an inline-only review gets a
  * neutral pointer. Approvals and GitLab discussions can remain bodyless.
  */
+/** What a narrowed retry will send, for the partial-submission notice. */
+export function describePartialRetry(partial: PRReviewSubmissionPartial, mrLabel: string): string {
+  const { retry } = partial;
+  const parts: string[] = [];
+  if (retry.fileComments.length > 0) {
+    parts.push(`the ${retry.fileComments.length} unposted inline comment${retry.fileComments.length === 1 ? '' : 's'}`);
+  }
+  if (retry.body !== undefined) parts.push('the unposted general comment');
+  if (partial.approval === 'failed') parts.push(`the ${mrLabel} decision`);
+  const what = parts.length > 1
+    ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`
+    : parts[0] ?? 'nothing';
+  const notAgain = retry.body !== undefined
+    ? 'posted comments are not sent again.'
+    : 'posted comments and the general note are not sent again.';
+  return `Retry sends only ${what}; ${notAgain}`;
+}
+
 export function buildPlatformReviewBody(
   action: PRReviewAction,
   platform: ReviewPlatform,
@@ -201,7 +282,7 @@ export function buildPlatformReviewBody(
   if (parts.length > 0) return parts.join('\n\n');
   const threadCount = target.fileComments.length + (target.fileLevelComments?.length ?? 0);
   // GitHub requires a body on COMMENT and REQUEST_CHANGES reviews alike.
-  if (action !== 'approve' && platform === 'github' && threadCount > 0) {
+  if (action !== 'approve' && getPRPlatformCapabilities({ platform }).reviewBodyRequired && threadCount > 0) {
     return 'See inline comments.';
   }
   return '';
@@ -220,11 +301,12 @@ export function buildPRActionRequest(
     throw new Error('Partial review target is missing its server-authorized retry');
   }
   const retry = target.partial?.retry;
-  // A narrowed retry (GitLab partial) resends only its own inline comments.
+  // A narrowed retry (GitLab/Bitbucket partial) resends only its own inline
+  // comments, plus the general comment when the server reports it unposted.
   const fileLevelComments = retry ? [] : target.fileLevelComments;
   return {
     action: retry?.action ?? action,
-    body: retry ? '' : body,
+    body: retry ? (retry.body ?? '') : body,
     fileComments: retry?.fileComments ?? target.fileComments,
     ...(fileLevelComments.length > 0 ? { fileLevelComments } : {}),
     ...(target.prUrl ? { targetPrUrl: target.prUrl } : {}),
@@ -242,11 +324,14 @@ export function buildReviewSubmission(
    *  `anchorSnapshot` equals that snapshot; anything else (outdated, or
    *  coordinates from a diff we cannot vouch for) goes in the review body. */
   knownSnapshots?: ReadonlyMap<string, string>,
-  /** Target platform. Only GitHub posts file-scoped comments as file-level
+  /** Target platform. Only platforms with the `fileLevelComments` capability
+   *  (GitHub) post file-scoped comments as file-level
    *  threads (#1599); anything else folds them into the review body. */
   platform?: ReviewPlatform,
+  /** Links a comment outside the diff to its lines at the head commit. */
+  permalink?: ReviewPermalink,
 ): ReviewSubmission {
-  const fileLevel = platform === 'github';
+  const fileLevel = platform !== undefined && getPRPlatformCapabilities({ platform }).fileLevelComments;
   const targets: SubmissionTarget[] = [];
   const orphanAnnotations: { reason: 'full-stack' | 'unmapped'; ann: CodeAnnotation }[] = [];
 
@@ -310,7 +395,8 @@ export function buildReviewSubmission(
     const sample = annotations[0];
     const fileComments = buildAnnotationFileComments(annotations, withheld);
     const fileLevelComments = fileLevel ? buildFileLevelComments(annotations) : [];
-    const fileScopedBody = buildFileScopedBody(annotations, withheld, fileLevel);
+    const fileScopedBody = buildFileScopedBody(annotations, withheld, fileLevel, permalink);
+    const outsideDiffCount = annotations.filter((a) => a.outsideDiff && (a.scope ?? 'line') === 'line').length;
     // Exclude the "" sentinel path of general (review-level) comments so they
     // don't inflate the file count.
     const uniqueFiles = new Set(annotations.map(a => a.filePath).filter(p => p.length > 0));
@@ -331,6 +417,7 @@ export function buildReviewSubmission(
       fileScopedBody,
       fileCount: uniqueFiles.size,
       annotationCount: annotations.length,
+      ...(outsideDiffCount > 0 ? { outsideDiffCount } : {}),
       status: 'pending',
     });
   }
@@ -394,6 +481,7 @@ export function ReviewSubmissionDialog({
   recoveryPersistsRefresh,
   mrLabel,
   platformLabel,
+  postingTo,
 }: ReviewSubmissionDialogProps) {
   const isCompactTouchLayout = useCompactTouchLayout();
   const generalCommentRef = useRef<HTMLTextAreaElement>(null);
@@ -510,6 +598,12 @@ export function ReviewSubmissionDialog({
         )}
         {!bodyLocked && <div className="mb-3" />}
 
+        {postingTo && !hasTargets && (
+          <p className="mb-3 text-sm text-muted-foreground" data-review-posting-to="">
+            Posting to <span className="font-medium text-foreground">{postingTo}</span>
+          </p>
+        )}
+
         {/* Targets */}
         {submission.targets.length > 0 && (
           <div className="mb-3">
@@ -552,6 +646,13 @@ export function ReviewSubmissionDialog({
                     <div className="text-xs text-muted-foreground">
                       {target.annotationCount} comment{target.annotationCount !== 1 ? 's' : ''} across {target.fileCount} file{target.fileCount !== 1 ? 's' : ''}
                     </div>
+                    {target.outsideDiffCount ? (
+                      <div className="text-xs text-muted-foreground mt-0.5" data-outside-diff-note>
+                        {target.outsideDiffCount === 1
+                          ? '1 comment is on lines outside the diff, so it goes in the review\'s main comment with the code quoted and a link.'
+                          : `${target.outsideDiffCount} comments are on lines outside the diff, so they go in the review's main comment with the code quoted and a link.`}
+                      </div>
+                    ) : null}
                     {(target.status === 'failed' || target.status === 'partial') && target.error && (
                       <div className="text-xs text-destructive mt-0.5">{target.error}</div>
                     )}
@@ -585,15 +686,18 @@ export function ReviewSubmissionDialog({
                             />
                           </>
                         )}
+                        {target.partial.reviewBodyError && (
+                          <div className="mt-1 break-words text-destructive">
+                            {target.partial.reviewBodyError}
+                          </div>
+                        )}
                         {target.partial.approval === 'failed' && (
                           <div className="mt-1 text-destructive">
                             {target.partial.approvalError ?? `Failed to approve ${mrLabel}.`}
                           </div>
                         )}
                         <div className="mt-1 text-muted-foreground">
-                          {target.partial.retry.fileComments.length > 0
-                            ? `Retry sends only the ${target.partial.retry.fileComments.length} unposted inline comment${target.partial.retry.fileComments.length === 1 ? '' : 's'}; posted comments and the general note are not sent again.`
-                            : `Retry only repeats the ${mrLabel} approval; posted comments and the general note are not sent again.`}
+                          {describePartialRetry(target.partial, mrLabel)}
                         </div>
                         <div className="mt-1 text-muted-foreground">
                           {recoveryPersistsRefresh

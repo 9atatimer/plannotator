@@ -1,3 +1,4 @@
+import { childEnv } from "@plannotator/shared/child-env";
 import { readCappedBytes } from "./git";
 import {
   type DiffResult,
@@ -8,6 +9,7 @@ import {
   type GitDiffOptions,
 } from "@plannotator/shared/review-core";
 import {
+  JJ_COLOR_FREE_ARGS,
   type ReviewJjRuntime,
   detectJjWorkspace as detectJjWorkspaceCore,
   getJjContext as getJjContextCore,
@@ -71,10 +73,12 @@ async function runJj(
   options?: { cwd?: string; timeoutMs?: number; maxOutputBytes?: number },
 ): Promise<GitCommandResult> {
   try {
-    const proc = Bun.spawn(["jj", ...args], {
+    const proc = Bun.spawn(["jj", ...JJ_COLOR_FREE_ARGS, ...args], {
       cwd: options?.cwd,
+      env: childEnv(),
       stdout: "pipe",
       stderr: "pipe",
+      windowsHide: true,
     });
 
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -107,10 +111,12 @@ async function runJjBytes(
   options?: { cwd?: string; timeoutMs?: number; maxOutputBytes?: number },
 ): Promise<GitBytesCommandResult> {
   try {
-    const proc = Bun.spawn(["jj", ...args], {
+    const proc = Bun.spawn(["jj", ...JJ_COLOR_FREE_ARGS, ...args], {
       cwd: options?.cwd,
+      env: childEnv(),
       stdout: "pipe",
       stderr: "pipe",
+      windowsHide: true,
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
     if (options?.timeoutMs) timer = setTimeout(() => proc.kill(), options.timeoutMs);

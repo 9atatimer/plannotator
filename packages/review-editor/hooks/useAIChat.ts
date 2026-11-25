@@ -2,10 +2,11 @@ import { useCallback, useRef } from 'react';
 import {
   useAIChat as useSharedAIChat,
   type AIChatEntry,
+  type AIRetryOptions,
   type AskAIParams,
   type PendingPermission,
 } from '@plannotator/ui/hooks/useAIChat';
-import { buildReviewContextPreamble } from '@plannotator/ui/utils/aiPrompt';
+import { buildReviewContextPreamble, buildSessionReviewIdentity } from '@plannotator/ui/utils/aiPrompt';
 export type { AIChatEntry, PendingPermission };
 
 interface Viewing {
@@ -27,6 +28,10 @@ interface UseAIChatOptions {
   providerId?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
+  /** The selected provider is "Ask this session": send the diff's identity,
+   *  never the on-screen patch, into the agent's own session. */
+  sessionBridge?: boolean;
+  storageKey?: string | null;
 }
 
 export function useAIChat({
@@ -38,6 +43,8 @@ export function useAIChat({
   providerId,
   model,
   reasoningEffort,
+  sessionBridge = false,
+  storageKey,
 }: UseAIChatOptions) {
   const chat = useSharedAIChat({
     context: {
@@ -47,6 +54,7 @@ export function useAIChat({
     providerId,
     model,
     reasoningEffort,
+    storageKey,
   });
 
   // View state changes mid-session; the session context is baked once. Read the
@@ -60,9 +68,21 @@ export function useAIChat({
   const reviewContextRef = useRef(reviewContext);
   reviewContextRef.current = reviewContext;
   const lastSentContextRef = useRef<string | undefined>(undefined);
+  const identityRef = useRef({ patch, diffType, base });
+  identityRef.current = { patch, diffType, base };
 
+  const chatRef = useRef(chat);
+  chatRef.current = chat;
   const ask = useCallback(
     (params: AskAIParams) => {
+      const chat = chatRef.current;
+      if (sessionBridge) {
+        // The session wrote (or can read) the changes; a pasted patch would stay
+        // in its context window for good.
+        lastSentContextRef.current = undefined;
+        const contextPreamble = buildSessionReviewIdentity(identityRef.current);
+        return chat.ask({ viewing: viewingRef.current, contextPreamble, ...params });
+      }
       const ctx = reviewContextRef.current;
       // Send the full context when this question starts a fresh underlying
       // session (first message, or after a provider/model switch — resetSession
@@ -74,8 +94,23 @@ export function useAIChat({
       lastSentContextRef.current = ctx;
       return chat.ask({ viewing: viewingRef.current, contextPreamble, ...params });
     },
+    [sessionBridge],
+  );
+
+  // Re-asking on a separate provider starts a fresh session there, so it gets
+  // the full "changes under review" block instead of the bridge's identity.
+  const retry = useCallback(
+    (questionId: string, options: AIRetryOptions = {}) => {
+      if (!options.providerId) return chat.retry(questionId, options);
+      const ctx = reviewContextRef.current;
+      lastSentContextRef.current = ctx;
+      return chat.retry(questionId, {
+        ...options,
+        params: { ...options.params, contextPreamble: buildReviewContextPreamble(ctx, { changed: true }) },
+      });
+    },
     [chat],
   );
 
-  return { ...chat, ask };
+  return { ...chat, ask, retry };
 }

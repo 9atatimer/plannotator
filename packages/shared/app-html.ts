@@ -1,15 +1,16 @@
 /**
  * Negotiated compression for the single-file app HTML (#1617).
  *
- * Every Plannotator server answers its SPA catch-all with the whole app as one
- * HTML document (~24 MB plan, ~17 MB review). Over a slow tunnel that is the
- * entire load time, so a session reachable over a network sends the page
- * brotli- or gzip-compressed when the client says it can decode it.
+ * Every Plannotator server answers its SPA catch-all with the app page, and
+ * the plan and review pages with the code-split chunks packed behind them
+ * (./packed-app). Over a slow tunnel the bytes are the load time, so a session
+ * reachable over a network sends the page and its text chunks brotli- or
+ * gzip-compressed when the client says it can decode it.
  *
- * Shared by the Bun servers (`appHtmlResponse`) and the Pi node:http servers
- * (`prepareAppHtml`, vendored to Pi by `apps/pi-extension/vendor.sh`), so the
- * negotiation and the cache cannot drift between runtimes. Only `node:zlib` is
- * used, which both runtimes provide.
+ * Shared by the Bun and the Pi node:http servers (through ./packed-app, and
+ * the Inbox's own page; vendored to Pi by `apps/pi-extension/vendor.sh`), so
+ * the negotiation and the cache cannot drift between runtimes. Only
+ * `node:zlib` is used, which both runtimes provide.
  *
  * Which sessions compress (the `compress` argument): remote mode
  * (PLANNOTATOR_REMOTE or SSH detection) and `--tailscale`-published sessions,
@@ -58,7 +59,7 @@ export const APP_HTML_BROTLI_QUALITY = 5;
 export const APP_HTML_GZIP_LEVEL = 6;
 
 /** Only a handful of distinct app bodies exist per process; bound it anyway. */
-const MAX_CACHED_BODIES = 4;
+const MAX_CACHED_BODIES = 8;
 
 interface Coding {
   name: string;
@@ -115,12 +116,18 @@ interface CacheEntry {
  * Module-level on purpose: one compression per body per process. In
  * long-lived hosts (the Pi extension, the OpenCode plugin) a module outlives
  * any one session, so the compressed bodies persist for the host process's
- * lifetime; the cache is bounded to MAX_CACHED_BODIES (4) distinct bodies,
- * oldest evicted first, and in practice holds the plan and review pages.
+ * lifetime; the cache is bounded to MAX_CACHED_BODIES (8) distinct bodies,
+ * oldest evicted first, and in practice holds the plan and review pages and
+ * code review's diagram engine files (./diagram-engine-assets).
  */
 const cache: CacheEntry[] = [];
 
-function compress(html: string, encoding: "br" | "gzip"): Promise<Buffer> {
+/**
+ * Compress `html` once, uncached, off the event loop. The packed app's chunks
+ * (./packed-app) use it with a cache of their own, so a page load's few dozen
+ * chunks never evict the page from the one above.
+ */
+export function compressAppText(html: string, encoding: "br" | "gzip"): Promise<Buffer> {
   const input = Buffer.from(html, "utf8");
   return new Promise((resolve, reject) => {
     const done = (err: Error | null, out: Buffer) => (err ? reject(err) : resolve(out));
@@ -153,7 +160,7 @@ export function encodeAppHtml(html: string, encoding: "br" | "gzip"): Promise<Bu
   let pending = entry.encoded[encoding];
   if (!pending) {
     const owner = entry;
-    pending = compress(html, encoding);
+    pending = compressAppText(html, encoding);
     owner.encoded[encoding] = pending;
     // A failed compression must not poison later requests.
     pending.catch(() => {
@@ -193,15 +200,18 @@ const CONTENT_TYPE = "text/html";
 /**
  * Negotiate and produce the body + headers for one app-HTML response.
  * `compress: false` (a local-only session) returns exactly the pre-#1617
- * response: the original string with `Content-Type` only.
+ * response: the original string with `Content-Type` only. `contentType`
+ * lets another large text body the app loads (code review's diagram engine
+ * files) take the same negotiation and cache.
  */
 export async function prepareAppHtml(
   html: string,
   acceptEncoding: string | null | undefined,
   compress: boolean,
+  contentType: string = CONTENT_TYPE,
 ): Promise<PreparedAppHtml> {
   if (!compress) {
-    return { encoding: "identity", body: html, headers: { "Content-Type": CONTENT_TYPE } };
+    return { encoding: "identity", body: html, headers: { "Content-Type": contentType } };
   }
   const encoding = negotiateAppHtmlEncoding(acceptEncoding);
   if (encoding !== "identity") {
@@ -211,7 +221,7 @@ export async function prepareAppHtml(
         encoding,
         body,
         headers: {
-          "Content-Type": CONTENT_TYPE,
+          "Content-Type": contentType,
           "Content-Encoding": encoding,
           "Content-Length": String(body.length),
           Vary: "Accept-Encoding",
@@ -224,13 +234,6 @@ export async function prepareAppHtml(
   return {
     encoding: "identity",
     body: html,
-    headers: { "Content-Type": CONTENT_TYPE, Vary: "Accept-Encoding" },
+    headers: { "Content-Type": contentType, Vary: "Accept-Encoding" },
   };
-}
-
-/** Fetch-API flavor for the Bun servers. */
-export async function appHtmlResponse(req: Request, html: string, compress: boolean): Promise<Response> {
-  const prepared = await prepareAppHtml(html, req.headers.get("accept-encoding"), compress);
-  // A Buffer is a valid fetch body in both runtimes; the lib types lag.
-  return new Response(prepared.body as BodyInit, { headers: prepared.headers });
 }

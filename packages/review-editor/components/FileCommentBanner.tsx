@@ -1,10 +1,15 @@
 import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CodeAnnotation } from '@plannotator/ui/types';
 import { sanitizeBlockHtml } from '@plannotator/ui/utils/sanitizeHtml';
+import { paintAuthorColors } from '@plannotator/ui/utils/authorColorContrast';
+import { ImageThumbnail } from '@plannotator/ui/components/ImageThumbnail';
 import { CommentMeta } from './CommentMeta';
 import { CommentActions } from './CommentActions';
 import { FileNameChip } from './FileNameChip';
 import { commentCopyText } from '../utils/annotationDisplay';
+import { isAgentGeneratedFinding } from '../utils/explainFinding';
+import { useConfigValue } from '@plannotator/ui/config';
+import { isCommentSubmitKey } from '@plannotator/ui/utils/commentSubmitKey';
 
 interface FileCommentBannerProps {
   /** File-scoped comments for ONE file (already filtered to scope === 'file'). */
@@ -13,6 +18,9 @@ interface FileCommentBannerProps {
   onSelect: (id: string | null) => void;
   onEdit: (id: string, text: string) => void;
   onDelete: (id: string) => void;
+  onExplain?: (id: string) => void;
+  agentFindingSources?: ReadonlySet<string>;
+  explainDisabled?: boolean;
   /** Re-measure hook for the virtualized all-files host (see FileCommentCard). */
   onHeightChange?: () => void;
 }
@@ -38,15 +46,19 @@ export const FileCommentCard: React.FC<{
   onSelect: (id: string | null) => void;
   onEdit: (id: string, text: string) => void;
   onDelete: (id: string) => void;
+  onExplain?: (id: string) => void;
+  agentFindingSources?: ReadonlySet<string>;
+  explainDisabled?: boolean;
   /** Fired after our rendered height changes (expand/collapse/edit) so the
    *  virtualized all-files host can re-measure this item. */
   onHeightChange?: () => void;
-}> = ({ comment, isSelected, onSelect, onEdit, onDelete, onHeightChange }) => {
+}> = ({ comment, isSelected, onSelect, onEdit, onDelete, onExplain, agentFindingSources, explainDisabled = false, onHeightChange }) => {
   // Default expanded (the comment IS the point of a guided review); the toggle
   // lets a reviewer collapse a long note back to one line to reach the hunks.
   const [collapsed, setCollapsed] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [draft, setDraft] = useState(comment.text ?? '');
+  const enterSavesComment = useConfigValue('enterSavesComment');
 
   // Tell the owner to re-measure when our height changes — in the all-files view
   // these cards live in Pierre's custom-header portal, whose height isn't auto-
@@ -64,6 +76,9 @@ export const FileCommentCard: React.FC<{
     () => (comment.text ? sanitizeBlockHtml(comment.text) : ''),
     [comment.text],
   );
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const bodyShown = !!comment.text && !collapsed && !isEditing;
+  useLayoutEffect(() => (bodyShown && bodyRef.current ? paintAuthorColors(bodyRef.current) : undefined), [html, bodyShown]);
 
   const saveEdit = () => {
     const trimmed = draft.trim();
@@ -102,6 +117,17 @@ export const FileCommentCard: React.FC<{
         createdAt={comment.createdAt}
       />
 
+      {/* Made in the rendered Markdown preview: the text it is about. */}
+      {comment.markdownPreview && !collapsed && (
+        <div
+          data-file-comment-markdown-quote=""
+          className="mt-1 mb-1 border-l-2 border-border/40 pl-1.5 text-xs italic text-muted-foreground/80 line-clamp-2"
+          title="Commented in the rendered Markdown preview"
+        >
+          {comment.markdownPreview.originalText}
+        </div>
+      )}
+
       {isEditing ? (
         <div className="mt-1" onClick={(e) => e.stopPropagation()}>
           <textarea
@@ -110,7 +136,7 @@ export const FileCommentCard: React.FC<{
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Escape') { e.preventDefault(); setIsEditing(false); }
-              else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveEdit(); }
+              else if (isCommentSubmitKey(e, enterSavesComment)) { e.preventDefault(); saveEdit(); }
             }}
             className="w-full min-h-[80px] resize-y rounded border border-border bg-background p-2 text-xs leading-relaxed focus:outline-none focus:ring-1 focus:ring-primary/40"
             placeholder="File comment (markdown supported)…"
@@ -128,14 +154,32 @@ export const FileCommentCard: React.FC<{
         collapsed ? (
           <div className="review-comment-body truncate text-muted-foreground/80">{firstLine(comment.text)}</div>
         ) : (
-          <div className="review-comment-body ai-markdown max-h-[220px] overflow-y-auto" dangerouslySetInnerHTML={{ __html: html }} />
+          <div ref={bodyRef} className="review-comment-body ai-markdown max-h-[220px] overflow-y-auto" dangerouslySetInnerHTML={{ __html: html }} />
         )
       ) : null}
+      {/* What the comment box attached (pictures, files), drawn as a whole-file line comment draws them. */}
+      {!collapsed && comment.images && comment.images.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5" data-file-comment-attachments="">
+          {comment.images.map((img) => (
+            <div key={img.path} className="text-center">
+              <ImageThumbnail path={img.path} size="sm" showRemove={false} file={img.kind === 'file'} />
+              <div className="max-w-[3rem] truncate text-[9px] text-muted-foreground" title={img.name}>
+                {img.name}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
       {!isEditing && (
         <CommentActions
           onEdit={() => { setDraft(comment.text ?? ''); setIsEditing(true); setCollapsed(false); }}
+          onExplain={isAgentGeneratedFinding(comment, agentFindingSources) && onExplain
+            ? () => onExplain(comment.id)
+            : undefined}
+          explainDisabled={explainDisabled}
           copyText={comment.text ? commentCopyText(comment) : undefined}
           onDelete={() => onDelete(comment.id)}
+          selected={isSelected}
         />
       )}
     </div>
@@ -154,6 +198,9 @@ export const FileCommentBanner: React.FC<FileCommentBannerProps> = ({
   onSelect,
   onEdit,
   onDelete,
+  onExplain,
+  agentFindingSources,
+  explainDisabled = false,
   onHeightChange,
 }) => {
   if (comments.length === 0) return null;
@@ -167,6 +214,9 @@ export const FileCommentBanner: React.FC<FileCommentBannerProps> = ({
           onSelect={onSelect}
           onEdit={onEdit}
           onDelete={onDelete}
+          onExplain={onExplain}
+          agentFindingSources={agentFindingSources}
+          explainDisabled={explainDisabled}
           onHeightChange={onHeightChange}
         />
       ))}
